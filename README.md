@@ -1,813 +1,149 @@
-# OpenAI Codex Auth Plugin for OpenCode
+# oc-chatgpt-multi-auth
 
 [![npm version](https://img.shields.io/npm/v/oc-chatgpt-multi-auth.svg)](https://www.npmjs.com/package/oc-chatgpt-multi-auth)
 [![npm downloads](https://img.shields.io/npm/dw/oc-chatgpt-multi-auth.svg)](https://www.npmjs.com/package/oc-chatgpt-multi-auth)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-OAuth plugin for OpenCode that lets you use ChatGPT Plus/Pro rate limits with models like `gpt-5.2`, `gpt-5-codex`, and `gpt-5.1-codex-max` (plus optional entitlement-gated Spark IDs and legacy Codex aliases).
+Use your ChatGPT Plus/Pro subscription inside OpenCode with OAuth login, GPT-5/Codex model presets, and multi-account failover.
 
-> [!NOTE]
-> **Renamed from `opencode-openai-codex-auth-multi`** — If you were using the old package, update your config to use `oc-chatgpt-multi-auth` instead. The rename was necessary because OpenCode blocks plugins containing `opencode-openai-codex-auth` in the name.
+`oc-chatgpt-multi-auth` is an OpenCode plugin for developers who want ChatGPT-backed GPT-5 and Codex workflows in OpenCode without switching to separate Platform API credentials for personal use. It uses the same official OAuth flow as the Codex CLI, adds model templates for current GPT-5 families, and can rotate across multiple ChatGPT accounts when one account is rate-limited or unavailable.
 
-## What You Get
+## What This Project Does
 
-- **GPT-5.2, GPT-5 Codex, GPT-5.1 Codex Max** and all GPT-5.x variants via ChatGPT OAuth
-- **Multi-account support** — Add up to 20 ChatGPT accounts, health-aware rotation with automatic failover
-- **Per-project accounts** — Each project gets its own account storage (new in v4.10.0)
-- **Click-to-switch** — Switch accounts directly from the OpenCode TUI
-- **Strict tool validation** — Automatically cleans schemas for compatibility with strict models
-- **Auto-update notifications** — Get notified when a new version is available
-- **21 template model presets** — Full variant system with reasoning levels (none/low/medium/high/xhigh)
-- **Prompt caching** — Session-based caching for faster multi-turn conversations
-- **Usage-aware errors** — Friendly messages with rate limit reset timing
-- **Plugin compatible** — Works alongside other OpenCode plugins (oh-my-opencode, dcp, etc.)
+- Adds an OpenCode plugin that authenticates with ChatGPT Plus/Pro through official OAuth
+- Ships ready-to-use model templates for `gpt-5.4`, `gpt-5-codex`, and related GPT-5 families
+- Routes requests through a stateless Codex-compatible request pipeline with automatic token refresh
+- Supports multi-account rotation, per-project account storage, and guided onboarding commands
 
----
+## Quick Start
 
-<details open>
-<summary><b>Terms of Service Warning — Read Before Installing</b></summary>
+```bash
+# 1. Install or refresh the plugin config
+npx -y oc-chatgpt-multi-auth@latest
+
+# 2. Sign in with ChatGPT Plus/Pro
+opencode auth login
+
+# 3. Run a prompt in OpenCode
+opencode run "Explain this repository" --model=openai/gpt-5.4 --variant=medium
+```
+
+What the installer does:
+
+- writes `~/.config/opencode/opencode.json`
+- backs up an existing config before changing it
+- normalizes the plugin entry to `"oc-chatgpt-multi-auth"`
+- clears the cached plugin copy so OpenCode reinstalls the latest package
+
+## Example Usage
+
+```bash
+# General GPT-5 workflow
+opencode run "Summarize the failing test and suggest a fix" --model=openai/gpt-5.4 --variant=medium
+
+# Codex-focused workflow
+opencode run "Refactor the retry logic and update the tests" --model=openai/gpt-5-codex --variant=high
+```
+
+## Usage Notice
 
 > [!CAUTION]
-> This plugin uses OpenAI's official OAuth authentication (the same method as OpenAI's official Codex CLI) for personal development use with your ChatGPT Plus/Pro subscription.
+> This project is for personal development use with your own ChatGPT Plus/Pro subscription.
 >
-> **This plugin is for personal development only:**
-> - Not for commercial services, API resale, or multi-user applications
-> - For production use, see [OpenAI Platform API](https://platform.openai.com/)
->
-> **By using this plugin, you acknowledge:**
-> - This is an unofficial tool not endorsed by OpenAI
-> - Users are responsible for compliance with [OpenAI's Terms of Use](https://openai.com/policies/terms-of-use/)
-> - You assume all risks associated with using this plugin
+> - It is not intended for commercial resale, shared multi-user access, or production services.
+> - It uses official OAuth authentication, but it is an independent open-source project and is not affiliated with OpenAI.
+> - For production applications, use the [OpenAI Platform API](https://platform.openai.com/).
+> - You are responsible for complying with [OpenAI's Terms of Use](https://openai.com/policies/terms-of-use/).
 
-</details>
+## Why This Exists
 
----
+OpenCode users often want the same GPT-5 and Codex model experience they use in ChatGPT, but inside a local terminal workflow. This plugin exists to bridge that gap cleanly:
+
+- official OAuth instead of scraped cookies or unofficial auth flows
+- OpenCode-ready model definitions instead of hand-rolled config every time
+- account rotation and recovery features for people who work across multiple ChatGPT accounts or workspaces
+
+## Features
+
+- Official OAuth login flow compatible with ChatGPT Plus/Pro access
+- GPT-5 and Codex model templates for modern and legacy OpenCode versions
+- Multi-account rotation with health-aware failover
+- Per-project account storage support
+- Beginner-focused commands such as `codex-setup`, `codex-help`, `codex-doctor`, and `codex-next`
+- Interactive account switching, labeling, tagging, and backup/import commands
+- Stateless request handling with `reasoning.encrypted_content` for multi-turn sessions
+- Request logging and troubleshooting hooks for debugging OpenCode integration issues
+
+## Common Workflows
+
+- Personal coding sessions in OpenCode using `gpt-5.4` or `gpt-5-codex`
+- Switching between personal and workspace-linked ChatGPT accounts
+- Keeping separate account pools per project or monorepo
+- Recovering from unsupported-model, auth, or rate-limit issues with guided commands
+
+## How It Works
+
+The plugin sits between OpenCode and the ChatGPT-backed Codex workflow:
+
+1. OpenCode loads the plugin and sends model requests through the plugin fetch pipeline.
+2. The plugin authenticates with ChatGPT OAuth and refreshes tokens when needed.
+3. Requests are normalized for the Codex backend and sent with `store: false`.
+4. The plugin chooses the best account/workspace candidate, retries intelligently, and preserves conversation continuity through encrypted reasoning state.
+
+See [Architecture](docs/development/ARCHITECTURE.md) for implementation details.
 
 ## Installation
 
-<details open>
-<summary><b>For Humans</b></summary>
+Use the quick-start path above for the fastest setup. For full setup, local development installs, legacy OpenCode support, and verification steps, see [Getting Started](docs/getting-started.md).
 
-**Option A: Let an LLM do it**
-
-Paste this into any LLM agent (Claude Code, OpenCode, Cursor, etc.):
-
-```
-Install the oc-chatgpt-multi-auth plugin and add the OpenAI model definitions to ~/.config/opencode/opencode.json by following: https://raw.githubusercontent.com/ndycode/oc-chatgpt-multi-auth/main/README.md
-```
-
-**Option B: One-command install**
+If you are on OpenCode `v1.0.209` or earlier, use:
 
 ```bash
-npx -y oc-chatgpt-multi-auth@latest
+npx -y oc-chatgpt-multi-auth@latest --legacy
 ```
-
-This writes the config to `~/.config/opencode/opencode.json`, backs up existing config, and clears the plugin cache.
-
-> Want legacy config (OpenCode v1.0.209 and below)? Add `--legacy` flag.
-
-**Option C: Manual setup**
-
-1. **Add the plugin** to `~/.config/opencode/opencode.json`:
-
-   ```json
-   {
-     "plugin": ["oc-chatgpt-multi-auth@latest"]
-   }
-   ```
-
-2. **Login** with your ChatGPT account:
-
-   ```bash
-   opencode auth login
-   ```
-
-3. **Add models** — Copy the [full configuration](#models) below
-
-4. **Use it:**
-
-   ```bash
-   opencode run "Hello" --model=openai/gpt-5.2 --variant=medium
-   ```
-
-</details>
-
-<details>
-<summary><b>For LLM Agents</b></summary>
-
-### Step-by-Step Instructions
-
-1. Edit the OpenCode configuration file at `~/.config/opencode/opencode.json`
-   
-   > **Note**: This path works on all platforms. On Windows, `~` resolves to your user home directory (e.g., `C:\Users\YourName`).
-
-2. Add the plugin to the `plugin` array:
-   ```json
-   {
-     "plugin": ["oc-chatgpt-multi-auth@latest"]
-   }
-   ```
-
-3. Add the model definitions from the [Full Models Configuration](#full-models-configuration-copy-paste-ready) section
-
-4. Set `provider` to `"openai"` and choose a model
-
-### Verification
-
-```bash
-opencode run "Hello" --model=openai/gpt-5.2 --variant=medium
-```
-
-</details>
-
----
-
-## Models
-
-### Model Reference
-
-| Model | Variants | Notes |
-|-------|----------|-------|
-| `gpt-5.2` | none, low, medium, high, xhigh | Latest GPT-5.2 with reasoning levels |
-| `gpt-5-codex` | low, medium, high | Canonical Codex model for code generation (default: high) |
-| `gpt-5.3-codex-spark` | low, medium, high, xhigh | Spark IDs are supported by the plugin, but access is entitlement-gated by account/workspace |
-| `gpt-5.1-codex-max` | low, medium, high, xhigh | Maximum context Codex |
-| `gpt-5.1-codex` | low, medium, high | Standard Codex |
-| `gpt-5.1-codex-mini` | medium, high | Lightweight Codex |
-| `gpt-5.1` | none, low, medium, high | GPT-5.1 base model |
-
-Config templates intentionally omit Spark model IDs by default to reduce entitlement failures on unsupported accounts. Add Spark manually only if your workspace is entitled.
-
-**Using variants:**
-```bash
-# Modern OpenCode (v1.0.210+)
-opencode run "Hello" --model=openai/gpt-5.2 --variant=high
-
-# Legacy OpenCode (v1.0.209 and below)
-opencode run "Hello" --model=openai/gpt-5.2-high
-```
-
-<details>
-<summary><b>Full Models Configuration (Copy-Paste Ready)</b></summary>
-
-Add this to your `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["oc-chatgpt-multi-auth@latest"],
-  "provider": {
-    "openai": {
-      "options": {
-        "reasoningEffort": "medium",
-        "reasoningSummary": "auto",
-        "textVerbosity": "medium",
-        "include": ["reasoning.encrypted_content"],
-        "store": false
-      },
-      "models": {
-        "gpt-5.2": {
-          "name": "GPT 5.2 (OAuth)",
-          "limit": { "context": 272000, "output": 128000 },
-          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
-          "variants": {
-            "none": { "reasoningEffort": "none" },
-            "low": { "reasoningEffort": "low" },
-            "medium": { "reasoningEffort": "medium" },
-            "high": { "reasoningEffort": "high" },
-            "xhigh": { "reasoningEffort": "xhigh" }
-          }
-        },
-        "gpt-5-codex": {
-          "name": "GPT 5 Codex (OAuth)",
-          "limit": { "context": 272000, "output": 128000 },
-          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
-          "variants": {
-            "low": { "reasoningEffort": "low" },
-            "medium": { "reasoningEffort": "medium" },
-            "high": { "reasoningEffort": "high" }
-          },
-          "options": {
-            "reasoningEffort": "high",
-            "reasoningSummary": "detailed"
-          }
-        },
-        "gpt-5.1-codex-max": {
-          "name": "GPT 5.1 Codex Max (OAuth)",
-          "limit": { "context": 272000, "output": 128000 },
-          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
-          "variants": {
-            "low": { "reasoningEffort": "low" },
-            "medium": { "reasoningEffort": "medium" },
-            "high": { "reasoningEffort": "high" },
-            "xhigh": { "reasoningEffort": "xhigh" }
-          }
-        },
-        "gpt-5.1-codex": {
-          "name": "GPT 5.1 Codex (OAuth)",
-          "limit": { "context": 272000, "output": 128000 },
-          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
-          "variants": {
-            "low": { "reasoningEffort": "low" },
-            "medium": { "reasoningEffort": "medium" },
-            "high": { "reasoningEffort": "high" }
-          }
-        },
-        "gpt-5.1-codex-mini": {
-          "name": "GPT 5.1 Codex Mini (OAuth)",
-          "limit": { "context": 272000, "output": 128000 },
-          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
-          "variants": {
-            "medium": { "reasoningEffort": "medium" },
-            "high": { "reasoningEffort": "high" }
-          }
-        },
-        "gpt-5.1": {
-          "name": "GPT 5.1 (OAuth)",
-          "limit": { "context": 272000, "output": 128000 },
-          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
-          "variants": {
-            "none": { "reasoningEffort": "none" },
-            "low": { "reasoningEffort": "low" },
-            "medium": { "reasoningEffort": "medium" },
-            "high": { "reasoningEffort": "high" }
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-Optional Spark model block (manual add only when entitled):
-```json
-"gpt-5.3-codex-spark": {
-  "name": "GPT 5.3 Codex Spark (OAuth)",
-  "limit": { "context": 272000, "output": 128000 },
-  "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
-  "variants": {
-    "low": { "reasoningEffort": "low" },
-    "medium": { "reasoningEffort": "medium" },
-    "high": { "reasoningEffort": "high" },
-    "xhigh": { "reasoningEffort": "xhigh" }
-  }
-}
-```
-
-For legacy OpenCode (v1.0.209 and below), use `config/opencode-legacy.json` which has individual model entries like `gpt-5.2-low`, `gpt-5.2-medium`, etc.
-
-</details>
-
----
-
-## Multi-Account Setup
-
-Add multiple ChatGPT accounts for higher combined quotas. The plugin uses **health-aware rotation** with automatic failover and supports up to 20 accounts.
-
-```bash
-opencode auth login  # Run again to add more accounts
-```
-
----
-
-## Account Management Tools
-
-The plugin provides built-in tools for managing your OpenAI accounts. These are available directly in OpenCode — just ask the agent or type the tool name.
-
-> **Note:** Tools were renamed from `openai-accounts-*` to `codex-*` in v4.12.0 for brevity.
-
-### codex-list
-
-List all configured accounts with their status.
-
-```
-codex-list
-```
-
-**Output:**
-```
-OpenAI Accounts (3 total):
-
-  [1] user@gmail.com (active)
-  [2] work@company.com
-  [3] backup@email.com
-
-Use codex-switch to change active account.
-```
-
----
-
-### codex-switch
-
-Switch to a different account by index (1-based).
-
-```
-codex-switch index=2
-```
-
-**Output:**
-```
-Switched to account [2] work@company.com
-```
-
----
-
-### codex-status
-
-Show detailed status including rate limits and health scores.
-
-```
-codex-status
-```
-
-**Output:**
-```
-OpenAI Account Status:
-
-[1] user@gmail.com (active)
-    Health: 100/100
-    Rate Limit: 45/50 requests remaining
-    Resets: 2m 30s
-    Last Used: 5 minutes ago
-
-[2] work@company.com
-    Health: 85/100
-    Rate Limit: 12/50 requests remaining
-    Resets: 8m 15s
-    Last Used: 1 hour ago
-```
-
----
-
-### codex-metrics
-
-Show live runtime metrics (request counts, latency, errors, rotations) for the current plugin process.
-
-```
-codex-metrics
-```
-
-**Output:**
-```
-Codex Plugin Metrics:
-
-Uptime: 12m
-Total upstream requests: 84
-Successful responses: 77
-Failed responses: 7
-Average successful latency: 842ms
-```
-
----
-
-### codex-health
-
-Check if all account tokens are still valid (read-only check).
-
-```
-codex-health
-```
-
-**Output:**
-```
-Checking 3 account(s):
-
-  ✓ [1] user@gmail.com: Healthy
-  ✓ [2] work@company.com: Healthy
-  ✗ [3] old@expired.com: Token expired
-
-Summary: 2 healthy, 1 unhealthy
-```
-
----
-
-### codex-refresh
-
-Refresh all OAuth tokens and save them to disk. Use this after long idle periods.
-
-```
-codex-refresh
-```
-
-**Output:**
-```
-Refreshing 3 account(s):
-
-  ✓ [1] user@gmail.com: Refreshed
-  ✓ [2] work@company.com: Refreshed
-  ✗ [3] old@expired.com: Failed - Token expired
-
-Summary: 2 refreshed, 1 failed
-```
-
-**Difference from health check:** `codex-health` only validates tokens. `codex-refresh` actually refreshes them and saves new tokens to disk.
-
----
-
-### codex-remove
-
-Remove an account by index. Useful for cleaning up expired accounts.
-
-```
-codex-remove index=3
-```
-
-**Output:**
-```
-Removed: [3] old@expired.com
-
-Remaining accounts: 2
-```
-
----
-
-### codex-export
-
-Export all accounts to a portable JSON file. Useful for backup or migration.
-
-```
-codex-export path="~/backup/accounts.json"
-```
-
-**Output:**
-```
-Exported 3 account(s) to ~/backup/accounts.json
-```
-
----
-
-### codex-import
-
-Import accounts from a JSON file (exported via `codex-export`). Merges with existing accounts.
-
-```
-codex-import path="~/backup/accounts.json"
-```
-
-**Output:**
-```
-Imported 2 new account(s) (1 duplicate skipped)
-
-Total accounts: 4
-```
-
----
-
-### Quick Reference
-
-| Tool | What It Does | Example |
-|------|--------------|---------|
-| `codex-list` | List all accounts | "list my accounts" |
-| `codex-switch` | Switch active account | "switch to account 2" |
-| `codex-status` | Show rate limits & health | "show account status" |
-| `codex-metrics` | Show runtime metrics | "show plugin metrics" |
-| `codex-health` | Validate tokens (read-only) | "check account health" |
-| `codex-refresh` | Refresh & save tokens | "refresh my tokens" |
-| `codex-remove` | Remove an account | "remove account 3" |
-| `codex-export` | Export accounts to file | "export my accounts" |
-| `codex-import` | Import accounts from file | "import accounts from backup" |
-
----
-
-## Rotation Behavior
-
-**How rotation works:**
-- Health scoring tracks success/failure per account
-- Token bucket prevents hitting rate limits
-- Hybrid selection prefers healthy accounts with available tokens
-- Always retries when all accounts are rate-limited (waits for reset with live countdown)
-- 20% jitter on retry delays to avoid thundering herd
-- Auto-removes accounts after 3 consecutive auth failures (new in v4.11.0)
-
-**Per-project accounts (v4.10.0+):**
-
-By default, each project gets its own account storage namespace. This means you can keep different active accounts per project without writing account files into your repo. Works from subdirectories too; the plugin walks up to find the project root (v4.11.0). Disable with `perProjectAccounts: false` in your config.
-
-**Storage locations:**
-- Per-project: `~/.opencode/projects/{project-key}/openai-codex-accounts.json`
-- Global (when per-project disabled): `~/.opencode/openai-codex-accounts.json`
-
----
-
-## Troubleshooting
-
-> **Quick reset**: Most issues can be resolved by deleting `~/.opencode/auth/openai.json` and running `opencode auth login` again.
-
-### Configuration Paths (All Platforms)
-
-OpenCode uses `~/.config/opencode/` on **all platforms** including Windows.
-
-| File | Path |
-|------|------|
-| Main config | `~/.config/opencode/opencode.json` |
-| Auth tokens | `~/.opencode/auth/openai.json` |
-| Multi-account (global) | `~/.opencode/openai-codex-accounts.json` |
-| Multi-account (per-project) | `~/.opencode/projects/{project-key}/openai-codex-accounts.json` |
-| Plugin config | `~/.opencode/openai-codex-auth-config.json` |
-| Debug logs | `~/.opencode/logs/codex-plugin/` |
-
-> **Windows users**: `~` resolves to your user home directory (e.g., `C:\Users\YourName`).
-
----
-
-<details>
-<summary><b>401 Unauthorized Error</b></summary>
-
-**Cause:** Token expired or not authenticated.
-
-**Solutions:**
-1. Re-authenticate:
-   ```bash
-   opencode auth login
-   ```
-2. Check auth file exists:
-   ```bash
-   cat ~/.opencode/auth/openai.json
-   ```
-
-</details>
-
-<details>
-<summary><b>Browser Doesn't Open for OAuth</b></summary>
-
-**Cause:** Port 1455 conflict or SSH/WSL environment.
-
-**Solutions:**
-1. **Manual URL paste:**
-   - Re-run `opencode auth login`
-   - Select **"ChatGPT Plus/Pro (manual URL paste)"**
-   - Paste the full redirect URL (including `#code=...`) after login
-
-2. **Check port availability:**
-   ```bash
-   # macOS/Linux
-   lsof -i :1455
-   
-   # Windows
-   netstat -ano | findstr :1455
-   ```
-
-3. **Stop Codex CLI if running** — Both use port 1455
-
-</details>
-
-<details>
-<summary><b>Model Not Found</b></summary>
-
-**Cause:** Missing provider prefix or config mismatch.
-
-**Solutions:**
-1. Use `openai/` prefix:
-   ```bash
-   # Correct
-   --model=openai/gpt-5.2
-   
-   # Wrong
-   --model=gpt-5.2
-   ```
-
-2. Verify model is in your config:
-   ```json
-   { "models": { "gpt-5.2": { ... } } }
-   ```
-
-</details>
-
-<details>
-<summary><b>Unsupported Codex Model for ChatGPT Account</b></summary>
-
-**Error example:** `Bad Request: {"detail":"The 'gpt-5.3-codex-spark' model is not supported when using Codex with a ChatGPT account."}`
-
-**Cause:** Active workspace/account is not entitled for the requested Codex model.
-
-**Solutions:**
-1. Re-auth to refresh workspace selection (most common Spark fix):
-   ```bash
-   opencode auth login
-   ```
-2. Add another entitled account/workspace. The plugin will try remaining accounts/workspaces before model fallback.
-3. Enable automatic fallback only if you want degraded-model retries when Spark is not entitled:
-   ```bash
-   CODEX_AUTH_UNSUPPORTED_MODEL_POLICY=fallback opencode
-   ```
-4. Use custom fallback chain in `~/.opencode/openai-codex-auth-config.json`:
-   ```json
-   {
-     "unsupportedCodexPolicy": "fallback",
-     "fallbackOnUnsupportedCodexModel": true,
-     "unsupportedCodexFallbackChain": {
-       "gpt-5-codex": ["gpt-5.2-codex"],
-       "gpt-5.3-codex": ["gpt-5-codex", "gpt-5.2-codex"],
-       "gpt-5.3-codex-spark": ["gpt-5-codex", "gpt-5.3-codex", "gpt-5.2-codex"]
-     }
-   }
-   ```
-5. Verify effective upstream model when needed:
-   ```bash
-   ENABLE_PLUGIN_REQUEST_LOGGING=1 CODEX_PLUGIN_LOG_BODIES=1 opencode run "ping" --model=openai/gpt-5.3-codex-spark
-   ```
-   The UI can keep showing your selected model while fallback is applied internally.
-
-</details>
-
-<details>
-<summary><b>Rate Limit Exceeded</b></summary>
-
-**Cause:** ChatGPT subscription usage limit reached.
-
-**Solutions:**
-1. Wait for reset (plugin shows timing in error message)
-2. Add more accounts: `opencode auth login`
-3. Switch to a different model family
-
-</details>
-
-<details>
-<summary><b>Multi-Turn Context Lost</b></summary>
-
-**Cause:** Old plugin version or missing config.
-
-**Solutions:**
-1. Update plugin:
-   ```bash
-   npx -y oc-chatgpt-multi-auth@latest
-   ```
-2. Ensure config has:
-   ```json
-   {
-     "include": ["reasoning.encrypted_content"],
-     "store": false
-   }
-   ```
-
-</details>
-
-<details>
-<summary><b>OAuth Callback Issues (Safari/WSL/Docker)</b></summary>
-
-**Safari HTTPS-only mode:**
-- Use Chrome or Firefox instead, or
-- Temporarily disable Safari > Settings > Privacy > "Enable HTTPS-only mode"
-
-**WSL2:**
-- Use VS Code's port forwarding, or
-- Configure Windows → WSL port forwarding
-
-**SSH / Remote:**
-```bash
-ssh -L 1455:localhost:1455 user@remote
-```
-
-**Docker / Containers:**
-- OAuth with localhost redirect doesn't work in containers
-- Use SSH port forwarding or manual URL flow
-
-</details>
-
----
-
-## Plugin Compatibility
-
-### oh-my-opencode
-
-Works alongside oh-my-opencode. No special configuration needed.
-
-```json
-{
-  "plugin": [
-    "oc-chatgpt-multi-auth@latest",
-    "oh-my-opencode@latest"
-  ]
-}
-```
-
-### @tarquinen/opencode-dcp
-
-List this plugin before dcp:
-
-```json
-{
-  "plugin": [
-    "oc-chatgpt-multi-auth@latest",
-    "@tarquinen/opencode-dcp@latest"
-  ]
-}
-```
-
-### Plugins You Don't Need
-
-- **openai-codex-auth** — Not needed. This plugin replaces the original.
-
----
 
 ## Configuration
 
-Create `~/.opencode/openai-codex-auth-config.json` for optional settings:
+Detailed configuration lives outside this README:
 
-### Model Behavior
+- [Getting Started](docs/getting-started.md) for install and first-run setup
+- [Configuration Reference](docs/configuration.md) for config keys, env vars, and fallback behavior
+- [Config Templates](config/README.md) for modern vs legacy OpenCode examples
 
-| Option | Default | What It Does |
-|--------|---------|--------------|
-| `requestTransformMode` | `native` | Request shaping mode: `native` keeps OpenCode payloads unchanged; `legacy` enables Codex compatibility rewrites |
-| `codexMode` | `true` | Legacy-only bridge prompt behavior (applies when `requestTransformMode=legacy`) |
-| `codexTuiV2` | `true` | Enables Codex-style terminal UI output (set `false` for legacy output) |
-| `codexTuiColorProfile` | `truecolor` | Terminal color profile for Codex UI (`truecolor`, `ansi256`, `ansi16`) |
-| `codexTuiGlyphMode` | `ascii` | Glyph mode for Codex UI (`ascii`, `unicode`, `auto`) |
-| `fastSession` | `false` | Forces low-latency settings per request (`reasoningEffort=none/low`, `reasoningSummary=auto`, `textVerbosity=low`) |
-| `fastSessionStrategy` | `hybrid` | `hybrid` speeds simple turns but keeps full-depth on complex prompts; `always` forces fast tuning on every turn |
-| `fastSessionMaxInputItems` | `30` | Max input items kept when fast tuning is applied |
+## Troubleshooting
 
-### Account Settings (v4.10.0+)
+Start here if the plugin does not load or authenticate correctly:
 
-| Option | Default | What It Does |
-|--------|---------|--------------|
-| `perProjectAccounts` | `true` | Each project gets its own account storage namespace under `~/.opencode/projects/` |
-| `toastDurationMs` | `5000` | How long toast notifications stay visible (ms) |
+- [Troubleshooting](docs/troubleshooting.md)
+- [Privacy & Data Handling](docs/privacy.md)
+- [FAQ](docs/faq.md)
+- [Security Policy](SECURITY.md)
 
-### Retry Behavior
+Common first checks:
 
-| Option | Default | What It Does |
-|--------|---------|--------------|
-| `retryAllAccountsRateLimited` | `true` | Wait and retry when all accounts are rate-limited |
-| `retryAllAccountsMaxWaitMs` | `0` | Max wait time (0 = unlimited) |
-| `retryAllAccountsMaxRetries` | `Infinity` | Max retry attempts |
-| `unsupportedCodexPolicy` | `strict` | Unsupported-model behavior: `strict` (return entitlement error) or `fallback` (retry next model in fallback chain) |
-| `fallbackOnUnsupportedCodexModel` | `false` | Legacy fallback toggle mapped to `unsupportedCodexPolicy` (prefer using `unsupportedCodexPolicy`) |
-| `fallbackToGpt52OnUnsupportedGpt53` | `true` | Legacy compatibility toggle for the `gpt-5.3-codex -> gpt-5.2-codex` edge when generic fallback is enabled |
-| `unsupportedCodexFallbackChain` | `{}` | Optional per-model fallback-chain override (map of `model -> [fallback1, fallback2, ...]`) |
-| `fetchTimeoutMs` | `60000` | Request timeout to Codex backend (ms) |
-| `streamStallTimeoutMs` | `45000` | Abort non-stream parsing if SSE stalls (ms) |
+- confirm `"plugin": ["oc-chatgpt-multi-auth"]` is present in your OpenCode config
+- rerun `opencode auth login`
+- inspect `~/.opencode/logs/codex-plugin/` after running one request with `ENABLE_PLUGIN_REQUEST_LOGGING=1`
 
-Default unsupported-model fallback chain (used when `unsupportedCodexPolicy` is `fallback`):
-- `gpt-5.3-codex -> gpt-5-codex -> gpt-5.2-codex`
-- `gpt-5.3-codex-spark -> gpt-5-codex -> gpt-5.3-codex -> gpt-5.2-codex` (applies if you manually select Spark model IDs)
-- `gpt-5.2-codex -> gpt-5-codex`
-- `gpt-5.1-codex -> gpt-5-codex`
+## FAQ
 
-### Environment Variables
+Short answers for the most common questions live in [docs/faq.md](docs/faq.md), including:
 
-```bash
-DEBUG_CODEX_PLUGIN=1 opencode                    # Enable debug logging
-ENABLE_PLUGIN_REQUEST_LOGGING=1 opencode         # Log request metadata
-CODEX_PLUGIN_LOG_BODIES=1 opencode               # Include raw request/response payloads in request logs (sensitive)
-CODEX_PLUGIN_LOG_LEVEL=debug opencode            # Set log level (debug|info|warn|error)
-CODEX_AUTH_REQUEST_TRANSFORM_MODE=legacy opencode # Re-enable legacy Codex request rewrites
-CODEX_MODE=0 opencode                            # Temporarily disable bridge prompt
-CODEX_TUI_V2=0 opencode                          # Disable Codex-style UI (legacy output)
-CODEX_TUI_COLOR_PROFILE=ansi16 opencode          # Force UI color profile
-CODEX_TUI_GLYPHS=unicode opencode                # Override glyph mode (ascii|unicode|auto)
-CODEX_AUTH_PREWARM=0 opencode                    # Disable startup prewarm (prompt/instruction cache warmup)
-CODEX_AUTH_FAST_SESSION=1 opencode               # Enable faster response defaults
-CODEX_AUTH_FAST_SESSION_STRATEGY=always opencode # Force fast mode for all prompts
-CODEX_AUTH_FAST_SESSION_MAX_INPUT_ITEMS=24 opencode # Tune fast-mode history window
-CODEX_AUTH_UNSUPPORTED_MODEL_POLICY=fallback opencode # Enable generic unsupported-model fallback
-CODEX_AUTH_FALLBACK_UNSUPPORTED_MODEL=1 opencode # Legacy fallback toggle (prefer policy var above)
-CODEX_AUTH_FALLBACK_GPT53_TO_GPT52=0 opencode    # Disable only the legacy gpt-5.3 -> gpt-5.2 edge
-CODEX_AUTH_FETCH_TIMEOUT_MS=120000 opencode      # Override request timeout
-CODEX_AUTH_STREAM_STALL_TIMEOUT_MS=60000 opencode # Override SSE stall timeout
-```
+- who this plugin is for
+- which OpenCode versions it supports
+- how the modern and legacy config templates differ
+- when to use this plugin versus the OpenAI Platform API
 
-For all options, see [docs/configuration.md](docs/configuration.md).
+## Contributing
 
----
+Contributions are welcome if they keep the project accurate, maintainable, and aligned with its personal-use scope.
 
-## Documentation
-
-- [Getting Started](docs/getting-started.md) — Complete installation guide
-- [Configuration](docs/configuration.md) — All configuration options
-- [Troubleshooting](docs/troubleshooting.md) — Common issues and fixes
-- [Architecture](docs/development/ARCHITECTURE.md) — How the plugin works
-
----
-
-## Credits
-
-- [numman-ali/opencode-openai-codex-auth](https://github.com/numman-ali/opencode-openai-codex-auth) by [numman-ali](https://github.com/numman-ali) — Original plugin
-- [ndycode](https://github.com/ndycode) — Multi-account support and maintenance
+- [Contributing Guide](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security Policy](SECURITY.md)
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).
 
-<details>
-<summary><b>Legal</b></summary>
-
-### Intended Use
-
-- Personal / internal development only
-- Respect subscription quotas and data handling policies
-- Not for production services or bypassing intended limits
-
-### Warning
-
-By using this plugin, you acknowledge:
-
-- **Terms of Service risk** — This approach may violate ToS of AI model providers
-- **No guarantees** — APIs may change without notice
-- **Assumption of risk** — You assume all legal, financial, and technical risks
-
-### Disclaimer
-
-- Not affiliated with OpenAI. This is an independent open-source project.
-- "ChatGPT", "GPT-5", "Codex", and "OpenAI" are trademarks of OpenAI, L.L.C.
-
-</details>
+ChatGPT, GPT-5, Codex, and OpenAI are trademarks of OpenAI, L.L.C.

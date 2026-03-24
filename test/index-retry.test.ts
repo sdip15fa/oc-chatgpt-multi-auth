@@ -24,6 +24,7 @@ vi.mock("../lib/request/fetch-helpers.js", () => ({
 	refreshAndUpdateToken: async (auth: any) => auth,
 	createCodexHeaders: () => new Headers(),
 	handleErrorResponse: async (response: Response) => ({ response }),
+	isDeactivatedWorkspaceError: () => false,
 	resolveUnsupportedCodexFallbackModel: () => undefined,
 	shouldFallbackToGpt52OnUnsupportedGpt53: () => false,
 	handleSuccessResponse: async (response: Response) => response,
@@ -53,6 +54,10 @@ vi.mock("../lib/accounts.js", () => {
 
 		getCurrentOrNextForFamilyHybrid() {
 			return this.getCurrentOrNextForFamily();
+		}
+
+		getSelectionExplainability() {
+			return [];
 		}
 
 		recordSuccess() {}
@@ -125,6 +130,8 @@ vi.mock("../lib/storage.js", () => ({
 	setStoragePath: () => {},
 	exportAccounts: async () => {},
 	importAccounts: async () => ({ imported: 0, total: 0 }),
+	previewImportAccounts: async () => ({ imported: 0, total: 0, skipped: 0 }),
+	createTimestampedBackupPath: () => "/tmp/codex-backup-test.json",
 }));
 
 vi.mock("../lib/auto-update-checker.js", () => ({

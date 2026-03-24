@@ -29,6 +29,7 @@ export const HTTP_STATUS = {
 export const OPENAI_HEADERS = {
 	BETA: "OpenAI-Beta",
 	ACCOUNT_ID: "chatgpt-account-id",
+	ORGANIZATION_ID: "openai-organization",
 	ORIGINATOR: "originator",
 	SESSION_ID: "session_id",
 	CONVERSATION_ID: "conversation_id",
@@ -74,6 +75,7 @@ export const PLATFORM_OPENERS = {
 /** OAuth authorization labels */
 export const AUTH_LABELS = {
 	OAUTH: "ChatGPT Plus/Pro MULTI (Codex Subscription)",
+	OAUTH_DEVICE_CODE: "ChatGPT Plus/Pro MULTI (Device Code)",
 	OAUTH_MANUAL: "ChatGPT Plus/Pro MULTI (Manual URL Paste)",
 	API_KEY: "Manually enter API Key MULTI",
 	INSTRUCTIONS:

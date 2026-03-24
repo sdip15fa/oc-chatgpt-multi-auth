@@ -173,8 +173,11 @@ function initFamilyState(defaultValue: number): Record<ModelFamily, number> {
 export interface ManagedAccount {
 	index: number;
 	accountId?: string;
+	organizationId?: string;
 	accountIdSource?: AccountIdSource;
 	accountLabel?: string;
+	accountTags?: string[];
+	accountNote?: string;
 	email?: string;
 	refreshToken: string;
 	enabled?: boolean;
@@ -187,7 +190,20 @@ export interface ManagedAccount {
 	rateLimitResetTimes: RateLimitStateV3;
 	coolingDownUntil?: number;
 	cooldownReason?: CooldownReason;
-	consecutiveAuthFailures?: number;
+}
+
+export interface AccountSelectionExplainability {
+	index: number;
+	enabled: boolean;
+	isCurrentForFamily: boolean;
+	eligible: boolean;
+	reasons: string[];
+	healthScore: number;
+	tokensAvailable: number;
+	rateLimitedUntil?: number;
+	coolingDownUntil?: number;
+	cooldownReason?: CooldownReason;
+	lastUsed: number;
 }
 
 export class AccountManager {
@@ -198,6 +214,7 @@ export class AccountManager {
 	private lastToastTime = 0;
 	private saveDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 	private pendingSave: Promise<void> | null = null;
+	private authFailuresByRefreshToken: Map<string, number> = new Map();
 
 	static async loadFromDisk(authFallback?: OAuthAuthDetails): Promise<AccountManager> {
 		const stored = await loadAccounts();
@@ -282,8 +299,11 @@ export class AccountManager {
 					return {
 						index,
 						accountId: matchesFallback ? fallbackAccountId ?? account.accountId : account.accountId,
+						organizationId: account.organizationId,
 						accountIdSource: account.accountIdSource,
 						accountLabel: account.accountLabel,
+						accountTags: account.accountTags,
+						accountNote: account.accountNote,
 						email: matchesFallback
 							? fallbackAccountEmail ?? sanitizeEmail(account.email)
 							: sanitizeEmail(account.email),
@@ -315,6 +335,7 @@ export class AccountManager {
 				this.accounts.push({
 					index: this.accounts.length,
 					accountId: fallbackAccountId,
+					organizationId: undefined,
 					accountIdSource: fallbackAccountId ? "token" : undefined,
 					email: fallbackAccountEmail,
 					refreshToken: authFallback.refresh,
@@ -347,6 +368,7 @@ export class AccountManager {
 				{
 					index: 0,
 					accountId: fallbackAccountId,
+					organizationId: undefined,
 					accountIdSource: fallbackAccountId ? "token" : undefined,
 					email: fallbackAccountEmail,
 					refreshToken: authFallback.refresh,
@@ -387,6 +409,75 @@ export class AccountManager {
 			...account,
 			rateLimitResetTimes: { ...account.rateLimitResetTimes },
 		}));
+	}
+
+	getSelectionExplainability(
+		family: ModelFamily,
+		model?: string | null,
+		now = nowMs(),
+	): AccountSelectionExplainability[] {
+		const quotaKey = model ? `${family}:${model}` : family;
+		const baseQuotaKey = getQuotaKey(family);
+		const modelQuotaKey = model ? getQuotaKey(family, model) : null;
+		const currentIndex = this.currentAccountIndexByFamily[family];
+		const healthTracker = getHealthTracker();
+		const tokenTracker = getTokenTracker();
+
+		return this.accounts.map((account) => {
+			clearExpiredRateLimits(account);
+			const enabled = account.enabled !== false;
+			const reasons: string[] = [];
+			let rateLimitedUntil: number | undefined;
+			const baseRateLimit = account.rateLimitResetTimes[baseQuotaKey];
+			const modelRateLimit = modelQuotaKey ? account.rateLimitResetTimes[modelQuotaKey] : undefined;
+			if (typeof baseRateLimit === "number" && baseRateLimit > now) {
+				rateLimitedUntil = baseRateLimit;
+			}
+			if (
+				typeof modelRateLimit === "number" &&
+				modelRateLimit > now &&
+				(rateLimitedUntil === undefined || modelRateLimit > rateLimitedUntil)
+			) {
+				rateLimitedUntil = modelRateLimit;
+			}
+
+			const coolingDownUntil =
+				typeof account.coolingDownUntil === "number" && account.coolingDownUntil > now
+					? account.coolingDownUntil
+					: undefined;
+
+			if (!enabled) reasons.push("disabled");
+			if (rateLimitedUntil !== undefined) reasons.push("rate-limited");
+			if (coolingDownUntil !== undefined) {
+				reasons.push(
+					account.cooldownReason ? `cooldown:${account.cooldownReason}` : "cooldown",
+				);
+			}
+
+			const tokensAvailable = tokenTracker.getTokens(account.index, quotaKey);
+			if (tokensAvailable < 1) reasons.push("token-bucket-empty");
+
+			const eligible =
+				enabled &&
+				rateLimitedUntil === undefined &&
+				coolingDownUntil === undefined &&
+				tokensAvailable >= 1;
+			if (reasons.length === 0) reasons.push("eligible");
+
+			return {
+				index: account.index,
+				enabled,
+				isCurrentForFamily: currentIndex === account.index,
+				eligible,
+				reasons,
+				healthScore: healthTracker.getScore(account.index, quotaKey),
+				tokensAvailable,
+				rateLimitedUntil,
+				coolingDownUntil,
+				cooldownReason: coolingDownUntil !== undefined ? account.cooldownReason : undefined,
+				lastUsed: account.lastUsed,
+			};
+		});
 	}
 
 	setActiveIndex(index: number): ManagedAccount | null {
@@ -604,6 +695,22 @@ export class AccountManager {
 		account.cooldownReason = reason;
 	}
 
+	/**
+	 * Mark every in-memory account sharing a refresh token as cooling down.
+	 * @returns Number of live accounts updated.
+	 */
+	markAccountsWithRefreshTokenCoolingDown(
+		refreshToken: string,
+		cooldownMs: number,
+		reason: CooldownReason,
+	): number {
+		const matches = this.accounts.filter((account) => account.refreshToken === refreshToken);
+		for (const account of matches) {
+			this.markAccountCoolingDown(account, cooldownMs, reason);
+		}
+		return matches.length;
+	}
+
 	isAccountCoolingDown(account: ManagedAccount): boolean {
 		if (account.coolingDownUntil === undefined) return false;
 		if (nowMs() >= account.coolingDownUntil) {
@@ -619,12 +726,22 @@ export class AccountManager {
 	}
 
 	incrementAuthFailures(account: ManagedAccount): number {
-		account.consecutiveAuthFailures = (account.consecutiveAuthFailures ?? 0) + 1;
-		return account.consecutiveAuthFailures;
+		const currentFailures = this.authFailuresByRefreshToken.get(account.refreshToken) ?? 0;
+		const newFailures = currentFailures + 1;
+		this.authFailuresByRefreshToken.set(account.refreshToken, newFailures);
+		return newFailures;
 	}
 
+	/**
+	 * Clear the authentication failure counter for the given account's refresh token.
+	 *
+	 * Notes:
+	 * - Failure counts are tracked per refresh token (not per account), so this clears
+	 *   shared failure state for all org variants that reuse the same token.
+	 * - Failure counts are in-memory only for the current AccountManager instance.
+	 */
 	clearAuthFailures(account: ManagedAccount): void {
-		account.consecutiveAuthFailures = 0;
+		this.authFailuresByRefreshToken.delete(account.refreshToken);
 	}
 
 	shouldShowAccountToast(accountIndex: number, debounceMs = 30000): boolean {
@@ -641,9 +758,13 @@ export class AccountManager {
 	}
 
 	updateFromAuth(account: ManagedAccount, auth: OAuthAuthDetails): void {
+		const previousRefreshToken = account.refreshToken;
 		account.refreshToken = auth.refresh;
 		account.access = auth.access;
 		account.expires = auth.expires;
+		if (previousRefreshToken !== account.refreshToken) {
+			this.authFailuresByRefreshToken.delete(previousRefreshToken);
+		}
 		const tokenAccountId = extractAccountId(auth.access);
 		if (
 			tokenAccountId &&
@@ -751,6 +872,29 @@ export class AccountManager {
 		return this.removeAccount(account);
 	}
 
+	/**
+	 * Remove all accounts that share the same refreshToken as the given account.
+	 * This is used when auth refresh fails to remove all org variants together.
+	 * @returns Number of accounts removed
+	 */
+	removeAccountsWithSameRefreshToken(account: ManagedAccount): number {
+		const refreshToken = account.refreshToken;
+		// Snapshot first because removeAccount mutates this.accounts.
+		const accountsToRemove = this.accounts.filter((acc) => acc.refreshToken === refreshToken);
+		let removedCount = 0;
+
+		for (const accountToRemove of accountsToRemove) {
+			if (this.removeAccount(accountToRemove)) {
+				removedCount++;
+			}
+		}
+
+		// Clear stale auth failure state for this refresh token
+		this.authFailuresByRefreshToken.delete(refreshToken);
+
+		return removedCount;
+	}
+
 	setAccountEnabled(index: number, enabled: boolean): ManagedAccount | null {
 		if (!Number.isFinite(index)) return null;
 		if (index < 0 || index >= this.accounts.length) return null;
@@ -773,8 +917,11 @@ export class AccountManager {
 			version: 3,
 			accounts: this.accounts.map((account) => ({
 				accountId: account.accountId,
+				organizationId: account.organizationId,
 				accountIdSource: account.accountIdSource,
 				accountLabel: account.accountLabel,
+				accountTags: account.accountTags,
+				accountNote: account.accountNote,
 				email: account.email,
 				refreshToken: account.refreshToken,
 				accessToken: account.access,

@@ -4,6 +4,89 @@ all notable changes to this project. dates are ISO format (YYYY-MM-DD).
 
 ## [unreleased]
 
+### added
+
+- **beginner operations toolkit**: added `codex-help`, `codex-setup` (with `wizard` mode + fallback), `codex-doctor` (`fix` mode), and `codex-next` for guided onboarding and recovery.
+- **account metadata commands**: added `codex-tag` and `codex-note`, plus `codex-list` tag filtering.
+- **interactive account pickers**: `codex-switch`, `codex-label`, and `codex-remove` now support optional index with interactive selection in compatible terminals.
+- **backup/import safety controls**: `codex-export` now supports auto timestamped backup paths; `codex-import` adds `dryRun` preview and automatic pre-import backup on apply.
+- **beginner safe mode config**: new `beginnerSafeMode` config key and `CODEX_AUTH_BEGINNER_SAFE_MODE` env override for conservative retry behavior.
+- **startup preflight summary**: one-time startup health summary with recommended next action.
+
+### changed
+
+- **account storage schema**: V3 account metadata now includes optional `accountTags` and `accountNote`.
+- **docs refresh for operational flows**: README + docs portal/development guides updated to reflect beginner commands, safe mode, interactive picker behavior, and backup/import safeguards.
+- **repository presentation refresh**: rewrote the README as a landing page, added a public FAQ and code of conduct, refreshed package metadata, and removed stale CI/test claims from public docs surfaces.
+- **test matrix expansion**: coverage now includes beginner UI helpers, safe-fix diagnostics edge cases, tag/note command behavior, and timestamped backup/import preview utilities.
+
+### fixed
+
+- **non-interactive command guidance**: optional-index commands provide explicit usage guidance when interactive menus are unavailable.
+- **doctor safe-fix edge path**: `codex-doctor fix` now reports a clear non-crashing message when no eligible account is available for auto-switch.
+- **first-time import flow**: `codex-import` no longer fails with `No accounts to export` when storage is empty; pre-import backup is skipped cleanly in zero-account setups.
+
+## [5.4.3] - 2026-03-06
+
+### added
+
+- **gpt-5.4 snapshot alias normalization**: added support for `gpt-5.4-2026-03-05*` and `gpt-5.4-pro-2026-03-05*` model IDs (including effort suffix variants).
+
+### changed
+
+- **legacy GPT-5 alias target updated**: `gpt-5`, `gpt-5-mini`, and `gpt-5-nano` now normalize to `gpt-5.4` as the default general family.
+- **gpt-5.4-pro family isolation**: prompt-family detection now keeps `gpt-5.4-pro` separate from `gpt-5.4` for independent prompt/cache handling while preserving fallback policy behavior (`gpt-5.4-pro -> gpt-5.4`).
+- **OpenCode 5.4 template limits updated**: shipped OpenCode config templates now set `gpt-5.4*` context to `1,000,000` (output remains `128,000`) and docs now include optional `model_context_window` / `model_auto_compact_token_limit` tuning guidance.
+
+### fixed
+
+- **5.4.3 regression/test coverage alignment**: expanded and corrected normalization, family-routing, and prompt-mapping tests for snapshot aliases, pro-family separation, and legacy alias behavior.
+
+## [5.4.2] - 2026-03-05
+
+### added
+
+- **gpt-5.4 + gpt-5.4-pro runtime support**: added model-map normalization and request-transform coverage for `gpt-5.4` (general) and optional `gpt-5.4-pro`.
+- **gpt-5.4-pro fallback edge**: default unsupported-model fallback chain now includes `gpt-5.4-pro -> gpt-5.4` when fallback policy is enabled.
+
+### changed
+
+- **template defaults updated to gpt-5.4**: modern + legacy config templates now use `gpt-5.4` variants as the default general-purpose family.
+- **docs refresh for 5.4 rollout**: README, getting-started, configuration, troubleshooting, docs index, and config docs now reflect `gpt-5.4` defaults and optional `gpt-5.4-pro` usage.
+- **test matrix expanded for 5.4**: unit, integration, and property tests now explicitly cover `gpt-5.4` and `gpt-5.4-pro` normalization/reasoning/fallback paths.
+
+### fixed
+
+- **quota probe model order**: quota snapshot probing now includes `gpt-5.4` first before legacy Codex probe models.
+
+## [5.4.0] - 2026-02-28
+
+### changed
+
+- **organization/account identity matching hardening**: org-scoped matching and collision pruning now enforce accountId-aware compatibility to preserve distinct same-org workspace identities.
+- **id-token organization binding source strictness**: id-token candidate org binding now prioritizes `idToken['https://api.openai.com/auth'].organizations[0].id`.
+
+### fixed
+
+- **organization-scoped account preservation**: org-different variants sharing a refresh token now preserve distinct identity entries during storage collision resolution.
+- **no-org duplicate collapse alignment**: fallback no-org duplicates now collapse consistently across storage, authorize, and prune operations.
+- **active-index remap stability**: index remapping during collision pruning/dedupe maintains stable active-index selection after account deduplication.
+
+## [5.3.0] - 2026-02-22
+
+### added
+
+- **workspace-aware account persistence**: oauth workspace candidates are preserved as distinct account entries to keep per-workspace routing stable across multi-account sessions.
+
+### fixed
+
+- **organization identity reconciliation**: account restoration now preserves organization/workspace identity across token refresh and flagged-account recovery paths.
+- **verify-flagged restore identity loss**: flagged-account restore no longer drops `organizationId` when an `accountId` already exists.
+
+### changed
+
+- **documentation alignment with current runtime structure**: refreshed README and docs portal/architecture guides to reflect native-vs-legacy request transforms, workspace-aware identity behavior, and current preset/test counts.
+
 ## [5.2.3] - 2026-02-21
 
 ### fixed

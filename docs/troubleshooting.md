@@ -1,10 +1,32 @@
-# Troubleshooting Guide
+# Troubleshooting
 
-Common issues and debugging techniques for the OpenCode OpenAI Codex Auth Plugin.
+Common setup, authentication, model, and request-debugging issues for `oc-chatgpt-multi-auth`.
 
 ---
 
 > **Quick Reset**: Most issues can be resolved by deleting `~/.opencode/auth/openai.json` and running `opencode auth login` again.
+
+If you prefer guided recovery before manual debugging, run:
+
+```text
+codex-setup
+codex-doctor
+codex-doctor --fix
+codex-next
+```
+
+For machine-readable automation or CI checks, these read-only tools also accept `format="json"`:
+
+```text
+codex-status format="json"
+codex-limits format="json"
+codex-health format="json"
+codex-next format="json"
+codex-list format="json"
+codex-dashboard format="json"
+codex-metrics format="json"
+codex-doctor deep=true format="json"
+```
 
 ---
 
@@ -32,7 +54,7 @@ The package was renamed from `opencode-openai-codex-auth-multi` to `oc-chatgpt-m
 Update your `~/.config/opencode/opencode.json`:
 ```json
 {
-  "plugin": ["oc-chatgpt-multi-auth@latest"]
+  "plugin": ["oc-chatgpt-multi-auth"]
 }
 ```
 
@@ -55,20 +77,20 @@ Update your `~/.config/opencode/opencode.json`:
 1. **Verify config path and plugin list**:
    - Global: `~/.config/opencode/opencode.json`
    - Project: `./.opencode.json`
-   - Entry should include: `"plugin": ["oc-chatgpt-multi-auth@latest"]`
+   - Entry should include: `"plugin": ["oc-chatgpt-multi-auth"]`
 2. **Confirm plugin cache location** (npm plugins are cached, not stored in `~/.opencode/plugins/`):
    ```bash
    ls ~/.cache/opencode/node_modules/oc-chatgpt-multi-auth
    ```
 3. **Remember: request logs only appear after the first OpenAI request**:
    ```bash
-   ENABLE_PLUGIN_REQUEST_LOGGING=1 opencode run "test" --model=openai/gpt-5.2
+   ENABLE_PLUGIN_REQUEST_LOGGING=1 opencode run "test" --model=openai/gpt-5.4
    ```
 4. **Check registry access**:
    ```bash
    npm view oc-chatgpt-multi-auth version
    ```
-5. **If the plugin is present but still won’t load**, upgrade to v4.8.1+ (fixes Node ESM load issues with `@opencode-ai/plugin`).
+5. **If the plugin is present but still won’t load**, rerun `npx -y oc-chatgpt-multi-auth@latest` so the installer refreshes the config and clears OpenCode's cached plugin copy.
 
 </details>
 
@@ -81,7 +103,7 @@ Update your `~/.config/opencode/opencode.json`:
 
 **What’s normal:**
 - The first request may fetch **Codex instructions** and/or the **OpenCode codex prompt** from GitHub.
-- v4.14.1+ uses **stale-while-revalidate caching** and a **startup prewarm** to reduce first-turn latency.
+- Current releases use **stale-while-revalidate caching** and a **startup prewarm** to reduce first-turn latency.
 
 **Tuning knobs:**
 1. Disable prewarm (if you prefer zero background fetches at startup):
@@ -160,8 +182,9 @@ Failed to access Codex API
 
 1. **Manual URL paste:**
    - Re-run `opencode auth login`
-   - Select **"ChatGPT Plus/Pro (Manual URL Paste)"**
-   - Paste the full redirect URL after login
+   - Select **"ChatGPT Plus/Pro MULTI (Device Code)"** first if you are on SSH, WSL, or a headless machine
+   - If device code is unavailable, fall back to **"ChatGPT Plus/Pro MULTI (Manual URL Paste)"**
+   - Paste the full redirect URL after login when using the manual flow
 
 2. **Check port 1455 availability:**
    ```bash
@@ -185,7 +208,7 @@ Failed to access Codex API
 **Solutions:**
 - Re-run `opencode auth login` to generate a fresh URL
 - Open the URL directly in browser (don't use a stale link)
-- For SSH/WSL/remote, use **"Manual URL Paste"** option
+- For SSH/WSL/remote, use **"Device Code"** first, then **"Manual URL Paste"** if needed
 
 </details>
 
@@ -213,7 +236,7 @@ Failed to access Codex API
 **Cause:** The plugin is using the wrong workspace/account id (personal vs business).
 
 **Solutions:**
-1. Upgrade to `oc-chatgpt-multi-auth@5.1.0` or newer (workspace routing logic was hardened for Business + Personal dual accounts).
+1. Upgrade to the current release of `oc-chatgpt-multi-auth` (workspace routing logic was hardened for Business + Personal dual accounts in the 5.x line).
 2. Re-run `opencode auth login` and select the correct workspace when prompted.
 3. If running non-interactively, set `CODEX_AUTH_ACCOUNT_ID` to the workspace account id and re-login.
 4. Verify the workspace has Codex access in the ChatGPT UI.
@@ -247,6 +270,17 @@ Failed to access Codex API
    DEBUG_CODEX_PLUGIN=1 ENABLE_PLUGIN_REQUEST_LOGGING=1 opencode run "ping" --model=openai/gpt-5-codex
    ```
 5. If you only need personal Plus/Pro usage, ensure login selected the intended personal workspace/account id.
+6. Run guided diagnostics and safe auto-remediation:
+   ```text
+   codex-doctor
+   codex-doctor --fix
+   ```
+7. If you are onboarding or returning after a long gap, run:
+   ```text
+   codex-setup
+   codex-setup --wizard
+   codex-next
+```
 
 </details>
 
@@ -280,6 +314,8 @@ opencode run "test" --model=openai/gpt-5-codex-low  # Must match config key
 | Wrong | Correct |
 |-------|---------|
 | `--model=gpt-5-codex-low` | `--model=openai/gpt-5-codex-low` |
+
+**Note:** `opencode models openai` currently shows only OpenCode's built-in provider catalog. If you add template-defined or custom models, use `opencode debug config` to confirm they were merged into the effective config.
 
 </details>
 
@@ -326,6 +362,7 @@ resolvedConfig: { reasoningEffort: 'low', ... }  ← Should show your options
    CODEX_AUTH_UNSUPPORTED_MODEL_POLICY=fallback opencode
    ```
 4. Default fallback chain (when policy is `fallback` and not overridden):
+   - `gpt-5.4-pro -> gpt-5.4` (if `gpt-5.4-pro` is selected manually)
    - `gpt-5.3-codex -> gpt-5-codex -> gpt-5.2-codex`
    - `gpt-5.3-codex-spark -> gpt-5-codex -> gpt-5.3-codex -> gpt-5.2-codex` (if Spark IDs are selected manually)
    - `gpt-5.2-codex -> gpt-5-codex`
@@ -336,6 +373,7 @@ resolvedConfig: { reasoningEffort: 'low', ... }  ← Should show your options
      "unsupportedCodexPolicy": "fallback",
      "fallbackOnUnsupportedCodexModel": true,
      "unsupportedCodexFallbackChain": {
+       "gpt-5.4-pro": ["gpt-5.4"],
        "gpt-5-codex": ["gpt-5.2-codex"],
        "gpt-5.3-codex": ["gpt-5-codex", "gpt-5.2-codex"],
        "gpt-5.3-codex-spark": ["gpt-5-codex", "gpt-5.3-codex", "gpt-5.2-codex"]
@@ -482,6 +520,44 @@ Your input exceeds the context window
 
 </details>
 
+<details>
+<summary><b>Account command says "Missing account number"</b></summary>
+
+**Symptoms:**
+- `codex-switch`, `codex-label`, or `codex-remove` returns a missing index message
+- You expected an interactive picker
+
+**Cause:** Interactive pickers require an interactive TTY session. In non-interactive sessions, you must pass `index`.
+
+**Solutions:**
+1. Pass explicit index arguments:
+   ```text
+   codex-switch index=2
+   codex-label index=2 label="Work"
+   codex-remove index=2
+   ```
+2. Run from an interactive terminal when you want picker menus.
+3. Use `codex-list` first to inspect valid index range.
+
+</details>
+
+<details>
+<summary><b>Import concerns: accidental overwrite or bad backup file</b></summary>
+
+**Recommended safe flow:**
+1. Preview first:
+   ```text
+   codex-import path="~/backup/accounts.json" dryRun=true
+   ```
+2. Apply only after preview:
+   ```text
+   codex-import path="~/backup/accounts.json"
+   ```
+3. Before apply, the plugin creates a timestamped pre-import backup when existing accounts are present.
+4. Use `codex-export` with no path to create timestamped backups in the storage-adjacent `backups/` directory.
+
+</details>
+
 ---
 
 ## OAuth Callback Issues
@@ -542,7 +618,7 @@ ssh -L 1455:localhost:1455 user@remote
 
 **Docker / Containers:**
 - OAuth with localhost redirect doesn't work in containers
-- Use SSH port forwarding or manual URL flow
+- Use Device Code first, then SSH port forwarding or manual URL flow if needed
 
 </details>
 
@@ -573,7 +649,7 @@ DEBUG_CODEX_PLUGIN=1 ENABLE_PLUGIN_REQUEST_LOGGING=1 CODEX_PLUGIN_LOG_BODIES=1 o
 <summary><b>Inspect Actual API Requests</b></summary>
 
 ```bash
-ENABLE_PLUGIN_REQUEST_LOGGING=1 CODEX_PLUGIN_LOG_BODIES=1 opencode run "test" --model=openai/gpt-5.2-low
+ENABLE_PLUGIN_REQUEST_LOGGING=1 CODEX_PLUGIN_LOG_BODIES=1 opencode run "test" --model=openai/gpt-5.4-low
 
 cat ~/.opencode/logs/codex-plugin/request-*-after-transform.json | jq '{
   model: .body.model,

@@ -14,8 +14,11 @@ export interface RateLimitStateV3 {
 
 export interface AccountMetadataV1 {
 	accountId?: string;
+	organizationId?: string;
 	accountIdSource?: AccountIdSource;
 	accountLabel?: string;
+	accountTags?: string[];
+	accountNote?: string;
 	email?: string;
 	refreshToken: string;
 	/** Optional cached access token (Codex CLI parity). */
@@ -39,8 +42,11 @@ export interface AccountStorageV1 {
 
 export interface AccountMetadataV3 {
 	accountId?: string;
+	organizationId?: string;
 	accountIdSource?: AccountIdSource;
 	accountLabel?: string;
+	accountTags?: string[];
+	accountNote?: string;
 	email?: string;
 	refreshToken: string;
 	/** Optional cached access token (Codex CLI parity). */
@@ -80,8 +86,11 @@ export function migrateV1ToV3(v1: AccountStorageV1): AccountStorageV3 {
 			}
 			return {
 				accountId: account.accountId,
+				organizationId: account.organizationId,
 				accountIdSource: account.accountIdSource,
 				accountLabel: account.accountLabel,
+				accountTags: account.accountTags,
+				accountNote: account.accountNote,
 				email: account.email,
 				refreshToken: account.refreshToken,
 				accessToken: account.accessToken,

@@ -1,5 +1,6 @@
 import { promises as fs, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { basename, dirname, join } from "node:path";
 import { ACCOUNT_LIMITS } from "./constants.js";
 import { createLogger } from "./logger.js";
 import { MODEL_FAMILIES, type ModelFamily } from "./prompts/codex.js";
@@ -31,6 +32,62 @@ export interface FlaggedAccountMetadataV1 extends AccountMetadataV3 {
 export interface FlaggedAccountStorageV1 {
 	version: 1;
 	accounts: FlaggedAccountMetadataV1[];
+}
+
+const normalizeWorkspaceIdentityPart = (value: unknown): string | undefined =>
+	typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+
+export function getWorkspaceIdentityKey(account: {
+	organizationId?: string;
+	accountId?: string;
+	refreshToken: string;
+}): string {
+	const organizationId = normalizeWorkspaceIdentityPart(account.organizationId);
+	const accountId = normalizeWorkspaceIdentityPart(account.accountId);
+	const refreshToken = normalizeWorkspaceIdentityPart(account.refreshToken) ?? "";
+	if (organizationId) {
+		return accountId
+			? `organizationId:${organizationId}|accountId:${accountId}`
+			: `organizationId:${organizationId}`;
+	}
+	if (accountId) {
+		return `accountId:${accountId}`;
+	}
+	return `refreshToken:${refreshToken}`;
+}
+
+export type ImportBackupMode = "none" | "best-effort" | "required";
+
+export interface ImportAccountsOptions {
+	/**
+	 * Optional prefix used for pre-import backup file names.
+	 * Only applied when backupMode is not "none".
+	 */
+	preImportBackupPrefix?: string;
+	/**
+	 * Backup policy before import apply:
+	 * - none: do not create a pre-import backup
+	 * - best-effort: attempt backup, continue on failure
+	 * - required: backup must succeed or import aborts
+	 */
+	backupMode?: ImportBackupMode;
+}
+
+export type ImportBackupStatus = "created" | "skipped" | "failed";
+
+export interface ImportAccountsResult {
+	imported: number;
+	total: number;
+	skipped: number;
+	backupStatus: ImportBackupStatus;
+	backupPath?: string;
+	backupError?: string;
+}
+
+export interface ImportPreviewResult {
+	imported: number;
+	total: number;
+	skipped: number;
 }
 
 /**
@@ -79,6 +136,10 @@ export function formatStorageErrorHint(error: unknown, path: string): string {
 
 let storageMutex: Promise<void> = Promise.resolve();
 
+/**
+ * Serializes storage I/O to keep account file reads/writes lock-step and avoid
+ * cross-request races during migration/seeding flows.
+ */
 function withStorageLock<T>(fn: () => Promise<T>): Promise<T> {
   const previousMutex = storageMutex;
   let releaseLock: () => void;
@@ -88,10 +149,88 @@ function withStorageLock<T>(fn: () => Promise<T>): Promise<T> {
   return previousMutex.then(fn).finally(() => releaseLock());
 }
 
+const WINDOWS_RENAME_RETRY_ATTEMPTS = 5;
+const WINDOWS_RENAME_RETRY_BASE_DELAY_MS = 10;
+const PRE_IMPORT_BACKUP_WRITE_TIMEOUT_MS = 3_000;
+
+function isWindowsLockError(error: unknown): error is NodeJS.ErrnoException {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return code === "EPERM" || code === "EBUSY";
+}
+
+async function renameWithWindowsRetry(sourcePath: string, destinationPath: string): Promise<void> {
+  let lastError: NodeJS.ErrnoException | null = null;
+
+  for (let attempt = 0; attempt < WINDOWS_RENAME_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      await fs.rename(sourcePath, destinationPath);
+      return;
+    } catch (error) {
+      if (isWindowsLockError(error)) {
+        lastError = error;
+        await new Promise((resolve) =>
+          setTimeout(resolve, WINDOWS_RENAME_RETRY_BASE_DELAY_MS * 2 ** attempt),
+        );
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+}
+
+async function writeFileWithTimeout(filePath: string, content: string, timeoutMs: number): Promise<void> {
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    await fs.writeFile(filePath, content, {
+      encoding: "utf-8",
+      mode: 0o600,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      const timeoutError = Object.assign(
+        new Error(`Timed out writing file after ${timeoutMs}ms`),
+        { code: "ETIMEDOUT" },
+      );
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+async function writePreImportBackupFile(backupPath: string, snapshot: AccountStorageV3): Promise<void> {
+  const uniqueSuffix = `${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  const tempPath = `${backupPath}.${uniqueSuffix}.tmp`;
+
+  try {
+    await fs.mkdir(dirname(backupPath), { recursive: true });
+    const backupContent = JSON.stringify(snapshot, null, 2);
+    await writeFileWithTimeout(tempPath, backupContent, PRE_IMPORT_BACKUP_WRITE_TIMEOUT_MS);
+    await renameWithWindowsRetry(tempPath, backupPath);
+  } catch (error) {
+    try {
+      await fs.unlink(tempPath);
+    } catch {
+      // Best effort temp-file cleanup.
+    }
+    throw error;
+  }
+}
+
 type AnyAccountStorage = AccountStorageV1 | AccountStorageV3;
 
 type AccountLike = {
+  organizationId?: string;
   accountId?: string;
+  accountIdSource?: AccountMetadataV3["accountIdSource"];
+  accountLabel?: string;
   email?: string;
   refreshToken: string;
   addedAt?: number;
@@ -241,13 +380,14 @@ function selectNewestAccount<T extends AccountLike>(
 }
 
 function deduplicateAccountsByKey<T extends AccountLike>(accounts: T[]): T[] {
+  const working = [...accounts];
   const keyToIndex = new Map<string, number>();
-  const indicesToKeep = new Set<number>();
+  const indicesToRemove = new Set<number>();
 
-  for (let i = 0; i < accounts.length; i += 1) {
-    const account = accounts[i];
+  for (let i = 0; i < working.length; i += 1) {
+    const account = working[i];
     if (!account) continue;
-    const key = account.accountId || account.refreshToken;
+    const key = toAccountIdentityKey(account);
     if (!key) continue;
 
     const existingIndex = keyToIndex.get(key);
@@ -256,44 +396,83 @@ function deduplicateAccountsByKey<T extends AccountLike>(accounts: T[]): T[] {
       continue;
     }
 
-    const existing = accounts[existingIndex];
-    const newest = selectNewestAccount(existing, account);
-    keyToIndex.set(key, newest === account ? i : existingIndex);
-  }
-
-  for (const idx of keyToIndex.values()) {
-    indicesToKeep.add(idx);
+    const newestIndex = pickNewestAccountIndex(working, existingIndex, i);
+    const obsoleteIndex = newestIndex === existingIndex ? i : existingIndex;
+    const target = working[newestIndex];
+    const source = working[obsoleteIndex];
+    if (target && source) {
+      working[newestIndex] = mergeAccountRecords(target, source);
+    }
+    indicesToRemove.add(obsoleteIndex);
+    keyToIndex.set(key, newestIndex);
   }
 
   const result: T[] = [];
-  for (let i = 0; i < accounts.length; i += 1) {
-    if (indicesToKeep.has(i)) {
-      const account = accounts[i];
-      if (account) result.push(account);
-    }
+  for (let i = 0; i < working.length; i += 1) {
+    if (indicesToRemove.has(i)) continue;
+    const account = working[i];
+    if (account) result.push(account);
   }
   return result;
 }
 
+function pickNewestAccountIndex<T extends AccountLike>(
+  accounts: T[],
+  existingIndex: number,
+  candidateIndex: number,
+): number {
+  const existing = accounts[existingIndex];
+  const candidate = accounts[candidateIndex];
+  if (!existing) return candidateIndex;
+  if (!candidate) return existingIndex;
+  const newest = selectNewestAccount(existing, candidate);
+  return newest === candidate ? candidateIndex : existingIndex;
+}
+
+function mergeAccountRecords<T extends AccountLike>(target: T, source: T): T {
+  const newest = selectNewestAccount(target, source);
+  const older = newest === target ? source : target;
+  return {
+    ...older,
+    ...newest,
+    organizationId: target.organizationId ?? source.organizationId,
+    accountId: target.accountId ?? source.accountId,
+    accountIdSource: target.accountIdSource ?? source.accountIdSource,
+    accountLabel: target.accountLabel ?? source.accountLabel,
+    email: target.email ?? source.email,
+  };
+}
+
 /**
  * Removes duplicate accounts, keeping the most recently used entry for each unique key.
- * Deduplication is based on accountId or refreshToken.
+ * Deduplication identity hierarchy: organizationId -> accountId -> refreshToken.
  * @param accounts - Array of accounts to deduplicate
  * @returns New array with duplicates removed
  */
-export function deduplicateAccounts<T extends { accountId?: string; refreshToken: string; lastUsed?: number; addedAt?: number }>(
+export function deduplicateAccounts<T extends { organizationId?: string; accountId?: string; refreshToken: string; lastUsed?: number; addedAt?: number }>(
   accounts: T[],
 ): T[] {
   return deduplicateAccountsByKey(accounts);
 }
 
 /**
- * Removes duplicate accounts by email, keeping the most recently used entry.
+ * Applies storage deduplication semantics used by normalize/import paths.
+ * 1) Dedupe only exact identity duplicates (organizationId -> accountId -> refreshToken),
+ *    preserving distinct workspace variants that share a refresh token.
+ * 2) Then apply legacy email dedupe only for entries that still do not have organizationId/accountId.
+ */
+function deduplicateAccountsForStorage<T extends AccountLike & { email?: string }>(accounts: T[]): T[] {
+  return deduplicateAccountsByEmail(deduplicateAccountsByKey(accounts));
+}
+
+/**
+ * Removes duplicate legacy accounts by email, keeping the most recently used entry.
+ * Accounts with organizationId/accountId are never merged by email to avoid collapsing workspace variants.
  * Accounts without email are always preserved.
  * @param accounts - Array of accounts to deduplicate
  * @returns New array with email duplicates removed
  */
-export function deduplicateAccountsByEmail<T extends { email?: string; lastUsed?: number; addedAt?: number }>(
+export function deduplicateAccountsByEmail<T extends { organizationId?: string; accountId?: string; email?: string; lastUsed?: number; addedAt?: number }>(
   accounts: T[],
 ): T[] {
   const emailToNewestIndex = new Map<string, number>();
@@ -302,6 +481,18 @@ export function deduplicateAccountsByEmail<T extends { email?: string; lastUsed?
   for (let i = 0; i < accounts.length; i += 1) {
     const account = accounts[i];
     if (!account) continue;
+
+    const organizationId = account.organizationId?.trim();
+    if (organizationId) {
+      indicesToKeep.add(i);
+      continue;
+    }
+
+    const accountId = account.accountId?.trim();
+    if (accountId) {
+      indicesToKeep.add(i);
+      continue;
+    }
 
     const email = account.email?.trim();
     if (!email) {
@@ -359,24 +550,55 @@ function clampIndex(index: number, length: number): number {
   return Math.max(0, Math.min(index, length - 1));
 }
 
-function toAccountKey(account: Pick<AccountMetadataV3, "accountId" | "refreshToken">): string {
-  return account.accountId || account.refreshToken;
+function toAccountIdentityKeys(
+  account: Pick<AccountMetadataV3, "organizationId" | "accountId" | "refreshToken">,
+): string[] {
+  const keys: string[] = [];
+  const organizationId = typeof account.organizationId === "string" ? account.organizationId.trim() : "";
+  if (organizationId) {
+    keys.push(`organizationId:${organizationId}`);
+  }
+
+  const accountId = typeof account.accountId === "string" ? account.accountId.trim() : "";
+  if (accountId) {
+    keys.push(`accountId:${accountId}`);
+  }
+
+  const refreshToken = typeof account.refreshToken === "string" ? account.refreshToken.trim() : "";
+  if (refreshToken) {
+    keys.push(`refreshToken:${refreshToken}`);
+  }
+
+  return keys;
 }
 
-function extractActiveKey(accounts: unknown[], activeIndex: number): string | undefined {
+function toAccountIdentityKey(account: Pick<AccountMetadataV3, "organizationId" | "accountId" | "refreshToken">): string | undefined {
+  return toAccountIdentityKeys(account)[0];
+}
+
+function extractActiveKeys(accounts: unknown[], activeIndex: number): string[] {
   const candidate = accounts[activeIndex];
-  if (!isRecord(candidate)) return undefined;
+  if (!isRecord(candidate)) return [];
 
-  const accountId =
-    typeof candidate.accountId === "string" && candidate.accountId.trim()
-      ? candidate.accountId
-      : undefined;
-  const refreshToken =
-    typeof candidate.refreshToken === "string" && candidate.refreshToken.trim()
-      ? candidate.refreshToken
-      : undefined;
+  return toAccountIdentityKeys({
+    organizationId: typeof candidate.organizationId === "string" ? candidate.organizationId : undefined,
+    accountId: typeof candidate.accountId === "string" ? candidate.accountId : undefined,
+    refreshToken: typeof candidate.refreshToken === "string" ? candidate.refreshToken : "",
+  });
+}
 
-  return accountId || refreshToken;
+function findAccountIndexByIdentityKeys(
+  accounts: Pick<AccountMetadataV3, "organizationId" | "accountId" | "refreshToken">[],
+  identityKeys: string[],
+): number {
+  if (identityKeys.length === 0) return -1;
+  for (const identityKey of identityKeys) {
+    const idx = accounts.findIndex((account) => toAccountIdentityKeys(account).includes(identityKey));
+    if (idx >= 0) {
+      return idx;
+    }
+  }
+  return -1;
 }
 
 /**
@@ -410,7 +632,7 @@ export function normalizeAccountStorage(data: unknown): AccountStorageV3 | null 
       : 0;
 
   const rawActiveIndex = clampIndex(activeIndexValue, rawAccounts.length);
-  const activeKey = extractActiveKey(rawAccounts, rawActiveIndex);
+  const activeKeys = extractActiveKeys(rawAccounts, rawActiveIndex);
 
   const fromVersion = data.version as AnyAccountStorage["version"];
   const baseStorage: AccountStorageV3 =
@@ -423,17 +645,13 @@ export function normalizeAccountStorage(data: unknown): AccountStorageV3 | null 
       isRecord(account) && typeof account.refreshToken === "string" && !!account.refreshToken.trim(),
   );
 
-  const deduplicatedAccounts = deduplicateAccountsByEmail(
-    deduplicateAccountsByKey(validAccounts),
-  );
+  const deduplicatedAccounts = deduplicateAccountsForStorage(validAccounts);
 
   const activeIndex = (() => {
     if (deduplicatedAccounts.length === 0) return 0;
 
-    if (activeKey) {
-      const mappedIndex = deduplicatedAccounts.findIndex(
-        (account) => toAccountKey(account) === activeKey,
-      );
+    if (activeKeys.length > 0) {
+      const mappedIndex = findAccountIndexByIdentityKeys(deduplicatedAccounts, activeKeys);
       if (mappedIndex >= 0) return mappedIndex;
     }
 
@@ -453,13 +671,11 @@ export function normalizeAccountStorage(data: unknown): AccountStorageV3 | null 
         : rawActiveIndex;
 
     const clampedRawIndex = clampIndex(rawIndex, rawAccounts.length);
-    const familyKey = extractActiveKey(rawAccounts, clampedRawIndex);
+    const familyKeys = extractActiveKeys(rawAccounts, clampedRawIndex);
 
     let mappedIndex = clampIndex(rawIndex, deduplicatedAccounts.length);
-    if (familyKey && deduplicatedAccounts.length > 0) {
-      const idx = deduplicatedAccounts.findIndex(
-        (account) => toAccountKey(account) === familyKey,
-      );
+    if (familyKeys.length > 0 && deduplicatedAccounts.length > 0) {
+      const idx = findAccountIndexByIdentityKeys(deduplicatedAccounts, familyKeys);
       if (idx >= 0) {
         mappedIndex = idx;
       }
@@ -482,9 +698,75 @@ export function normalizeAccountStorage(data: unknown): AccountStorageV3 | null 
  * @returns AccountStorageV3 if file exists and is valid, null otherwise
  */
 export async function loadAccounts(): Promise<AccountStorageV3 | null> {
-  return loadAccountsInternal(saveAccounts);
+  return withStorageLock(async () => loadAccountsInternal(saveAccountsUnlocked));
 }
 
+/**
+ * Resolves the global (non-project) account storage path.
+ */
+function getGlobalAccountsStoragePath(): string {
+  return join(getConfigDir(), ACCOUNTS_FILE_NAME);
+}
+
+/**
+ * Returns true when project-scoped storage is active and a global fallback is meaningful.
+ */
+function shouldUseProjectGlobalFallback(): boolean {
+  return Boolean(currentStoragePath && currentProjectRoot);
+}
+
+/**
+ * Loads account data from global storage as a fallback when project storage is missing.
+ * Returns null for missing/unusable global storage and never throws to callers.
+ */
+async function loadGlobalAccountsFallback(): Promise<AccountStorageV3 | null> {
+  if (!shouldUseProjectGlobalFallback() || !currentStoragePath) {
+    return null;
+  }
+
+  const globalStoragePath = getGlobalAccountsStoragePath();
+  if (globalStoragePath === currentStoragePath) {
+    return null;
+  }
+
+  try {
+    const content = await fs.readFile(globalStoragePath, "utf-8");
+    const data = JSON.parse(content) as unknown;
+
+    const schemaErrors = getValidationErrors(AnyAccountStorageSchema, data);
+    if (schemaErrors.length > 0) {
+      log.warn("Global account storage schema validation warnings", {
+        path: globalStoragePath,
+        errors: schemaErrors.slice(0, 5),
+      });
+    }
+
+    const normalized = normalizeAccountStorage(data);
+    if (!normalized) return null;
+
+    log.info("Loaded global account storage as project fallback", {
+      from: globalStoragePath,
+      to: currentStoragePath,
+      accounts: normalized.accounts.length,
+    });
+    return normalized;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      log.warn("Failed to load global fallback account storage", {
+        from: globalStoragePath,
+        to: currentStoragePath,
+        error: String(error),
+      });
+    }
+    return null;
+  }
+}
+
+/**
+ * Core account-loading routine shared by normal reads and transactional storage handlers.
+ * Handles schema normalization, legacy migration, and optional fallback seeding.
+ */
 async function loadAccountsInternal(
   persistMigration: ((storage: AccountStorageV3) => Promise<void>) | null,
 ): Promise<AccountStorageV3 | null> {
@@ -520,13 +802,51 @@ async function loadAccountsInternal(
         ? await migrateLegacyProjectStorageIfNeeded(persistMigration)
         : null;
       if (migrated) return migrated;
-      return null;
+      const globalFallback = await loadGlobalAccountsFallback();
+      if (!globalFallback) return null;
+
+      if (persistMigration) {
+        const seedPath = getStoragePath();
+        try {
+          await fs.access(seedPath);
+          return globalFallback;
+        } catch (accessError) {
+          const accessCode = (accessError as NodeJS.ErrnoException).code;
+          if (accessCode !== "ENOENT") {
+            log.warn("Failed to inspect project seed path before fallback seeding", {
+              path: seedPath,
+              error: String(accessError),
+            });
+            return globalFallback;
+          }
+          // File is missing; proceed with seed write.
+        }
+
+        try {
+          await persistMigration(globalFallback);
+          log.info("Seeded project account storage from global fallback", {
+            path: seedPath,
+            accounts: globalFallback.accounts.length,
+          });
+        } catch (persistError) {
+          log.warn("Failed to seed project storage from global fallback", {
+            path: seedPath,
+            error: String(persistError),
+          });
+        }
+      }
+
+      return globalFallback;
     }
     log.error("Failed to load account storage", { error: String(error) });
     return null;
   }
 }
 
+/**
+ * Writes account storage without acquiring the outer storage mutex.
+ * Callers must already be inside withStorageLock when using this helper directly.
+ */
 async function saveAccountsUnlocked(storage: AccountStorageV3): Promise<void> {
   const path = getStoragePath();
   const uniqueSuffix = `${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
@@ -536,7 +856,10 @@ async function saveAccountsUnlocked(storage: AccountStorageV3): Promise<void> {
     await fs.mkdir(dirname(path), { recursive: true });
     await ensureGitignore(path);
 
-    const content = JSON.stringify(storage, null, 2);
+    // Normalize before persisting so every write path enforces dedup semantics
+    // (exact identity dedupe plus legacy email dedupe for identity-less records).
+    const normalizedStorage = normalizeAccountStorage(storage) ?? storage;
+    const content = JSON.stringify(normalizedStorage, null, 2);
     await fs.writeFile(tempPath, content, { encoding: "utf-8", mode: 0o600 });
 
     const stats = await fs.stat(tempPath);
@@ -545,23 +868,7 @@ async function saveAccountsUnlocked(storage: AccountStorageV3): Promise<void> {
       throw emptyError;
     }
 
-    // Retry rename with exponential backoff for Windows EPERM/EBUSY
-    let lastError: NodeJS.ErrnoException | null = null;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        await fs.rename(tempPath, path);
-        return;
-      } catch (renameError) {
-        const code = (renameError as NodeJS.ErrnoException).code;
-        if (code === "EPERM" || code === "EBUSY") {
-          lastError = renameError as NodeJS.ErrnoException;
-          await new Promise(r => setTimeout(r, 10 * Math.pow(2, attempt)));
-          continue;
-        }
-        throw renameError;
-      }
-    }
-    if (lastError) throw lastError;
+    await renameWithWindowsRetry(tempPath, path);
   } catch (error) {
     try {
       await fs.unlink(tempPath);
@@ -590,6 +897,10 @@ async function saveAccountsUnlocked(storage: AccountStorageV3): Promise<void> {
   }
 }
 
+/**
+ * Executes a read-modify-write transaction under the storage lock and exposes
+ * an unlocked persist callback so nested save operations do not deadlock.
+ */
 export async function withAccountStorageTransaction<T>(
   handler: (
     current: AccountStorageV3 | null,
@@ -638,7 +949,7 @@ function normalizeFlaggedStorage(data: unknown): FlaggedAccountStorageV1 {
 		return { version: 1, accounts: [] };
 	}
 
-	const byRefreshToken = new Map<string, FlaggedAccountMetadataV1>();
+	const byIdentityKey = new Map<string, FlaggedAccountMetadataV1>();
 	for (const rawAccount of data.accounts) {
 		if (!isRecord(rawAccount)) continue;
 		const refreshToken =
@@ -658,6 +969,14 @@ function normalizeFlaggedStorage(data: unknown): FlaggedAccountStorageV1 {
 			value: unknown,
 		): value is AccountMetadataV3["cooldownReason"] =>
 			value === "auth-failure" || value === "network-error";
+		const normalizeTags = (value: unknown): string[] | undefined => {
+			if (!Array.isArray(value)) return undefined;
+			const normalized = value
+				.filter((entry): entry is string => typeof entry === "string")
+				.map((entry) => entry.trim().toLowerCase())
+				.filter((entry) => entry.length > 0);
+			return normalized.length > 0 ? Array.from(new Set(normalized)) : undefined;
+		};
 
 		let rateLimitResetTimes: AccountMetadataV3["rateLimitResetTimes"] | undefined;
 		if (isRecord(rawAccount.rateLimitResetTimes)) {
@@ -681,14 +1000,23 @@ function normalizeFlaggedStorage(data: unknown): FlaggedAccountStorageV1 {
 		const cooldownReason = isCooldownReason(rawAccount.cooldownReason)
 			? rawAccount.cooldownReason
 			: undefined;
+		const accountTags = normalizeTags(rawAccount.accountTags);
+		const accountNote =
+			typeof rawAccount.accountNote === "string" && rawAccount.accountNote.trim()
+				? rawAccount.accountNote.trim()
+				: undefined;
 
 		const normalized: FlaggedAccountMetadataV1 = {
 			refreshToken,
 			addedAt: typeof rawAccount.addedAt === "number" ? rawAccount.addedAt : flaggedAt,
 			lastUsed: typeof rawAccount.lastUsed === "number" ? rawAccount.lastUsed : flaggedAt,
+			organizationId:
+				typeof rawAccount.organizationId === "string" ? rawAccount.organizationId : undefined,
 			accountId: typeof rawAccount.accountId === "string" ? rawAccount.accountId : undefined,
 			accountIdSource,
 			accountLabel: typeof rawAccount.accountLabel === "string" ? rawAccount.accountLabel : undefined,
+			accountTags,
+			accountNote,
 			email: typeof rawAccount.email === "string" ? rawAccount.email : undefined,
 			enabled: typeof rawAccount.enabled === "boolean" ? rawAccount.enabled : undefined,
 			lastSwitchReason,
@@ -700,16 +1028,20 @@ function normalizeFlaggedStorage(data: unknown): FlaggedAccountStorageV1 {
 			flaggedReason: typeof rawAccount.flaggedReason === "string" ? rawAccount.flaggedReason : undefined,
 			lastError: typeof rawAccount.lastError === "string" ? rawAccount.lastError : undefined,
 		};
-		byRefreshToken.set(refreshToken, normalized);
+		// Keep flagged dedup aligned with active cleanup so sibling workspaces only
+		// collapse when they resolve to the same shared workspace identity.
+		byIdentityKey.set(getWorkspaceIdentityKey(normalized), normalized);
 	}
 
 	return {
 		version: 1,
-		accounts: Array.from(byRefreshToken.values()),
+		accounts: Array.from(byIdentityKey.values()),
 	};
 }
 
-export async function loadFlaggedAccounts(): Promise<FlaggedAccountStorageV1> {
+async function loadFlaggedAccountsUnlocked(
+	saveUnlocked: (storage: FlaggedAccountStorageV1) => Promise<void>,
+): Promise<FlaggedAccountStorageV1> {
 	const path = getFlaggedAccountsPath();
 	const empty: FlaggedAccountStorageV1 = { version: 1, accounts: [] };
 
@@ -735,7 +1067,7 @@ export async function loadFlaggedAccounts(): Promise<FlaggedAccountStorageV1> {
 		const legacyData = JSON.parse(legacyContent) as unknown;
 		const migrated = normalizeFlaggedStorage(legacyData);
 		if (migrated.accounts.length > 0) {
-			await saveFlaggedAccounts(migrated);
+			await saveUnlocked(migrated);
 		}
 		try {
 			await fs.unlink(legacyPath);
@@ -758,26 +1090,50 @@ export async function loadFlaggedAccounts(): Promise<FlaggedAccountStorageV1> {
 	}
 }
 
+export async function loadFlaggedAccounts(): Promise<FlaggedAccountStorageV1> {
+	return withStorageLock(async () => loadFlaggedAccountsUnlocked(saveFlaggedAccountsUnlocked));
+}
+
+async function saveFlaggedAccountsUnlocked(storage: FlaggedAccountStorageV1): Promise<void> {
+	const path = getFlaggedAccountsPath();
+	const uniqueSuffix = `${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+	const tempPath = `${path}.${uniqueSuffix}.tmp`;
+
+	try {
+		await fs.mkdir(dirname(path), { recursive: true });
+		const content = JSON.stringify(normalizeFlaggedStorage(storage), null, 2);
+		await fs.writeFile(tempPath, content, { encoding: "utf-8", mode: 0o600 });
+		await renameWithWindowsRetry(tempPath, path);
+	} catch (error) {
+		try {
+			await fs.unlink(tempPath);
+		} catch {
+			// Ignore cleanup failures.
+		}
+		log.error("Failed to save flagged account storage", { path, error: String(error) });
+		throw error;
+	}
+}
+
+/**
+ * Executes a read-modify-write transaction for flagged account storage under the
+ * shared storage lock so concurrent callers cannot lose updates.
+ */
+export async function withFlaggedAccountStorageTransaction<T>(
+	handler: (
+		current: FlaggedAccountStorageV1,
+		persist: (storage: FlaggedAccountStorageV1) => Promise<void>,
+	) => Promise<T>,
+): Promise<T> {
+	return withStorageLock(async () => {
+		const current = await loadFlaggedAccountsUnlocked(saveFlaggedAccountsUnlocked);
+		return handler(current, saveFlaggedAccountsUnlocked);
+	});
+}
+
 export async function saveFlaggedAccounts(storage: FlaggedAccountStorageV1): Promise<void> {
 	return withStorageLock(async () => {
-		const path = getFlaggedAccountsPath();
-		const uniqueSuffix = `${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
-		const tempPath = `${path}.${uniqueSuffix}.tmp`;
-
-		try {
-			await fs.mkdir(dirname(path), { recursive: true });
-			const content = JSON.stringify(normalizeFlaggedStorage(storage), null, 2);
-			await fs.writeFile(tempPath, content, { encoding: "utf-8", mode: 0o600 });
-			await fs.rename(tempPath, path);
-		} catch (error) {
-			try {
-				await fs.unlink(tempPath);
-			} catch {
-				// Ignore cleanup failures.
-			}
-			log.error("Failed to save flagged account storage", { path, error: String(error) });
-			throw error;
-		}
+		await saveFlaggedAccountsUnlocked(storage);
 	});
 }
 
@@ -791,6 +1147,106 @@ export async function clearFlaggedAccounts(): Promise<void> {
 				log.error("Failed to clear flagged account storage", { error: String(error) });
 			}
 		}
+	});
+}
+
+function formatBackupTimestamp(date: Date = new Date()): string {
+	const yyyy = String(date.getFullYear());
+	const mm = String(date.getMonth() + 1).padStart(2, "0");
+	const dd = String(date.getDate()).padStart(2, "0");
+	const hh = String(date.getHours()).padStart(2, "0");
+	const min = String(date.getMinutes()).padStart(2, "0");
+	const ss = String(date.getSeconds()).padStart(2, "0");
+	const mmm = String(date.getMilliseconds()).padStart(3, "0");
+	return `${yyyy}${mm}${dd}-${hh}${min}${ss}${mmm}`;
+}
+
+function sanitizeBackupPrefix(prefix: string): string {
+	const trimmed = prefix.trim();
+	const safe = trimmed
+		.replace(/[^a-zA-Z0-9_-]+/g, "-")
+		.replace(/-+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	return safe.length > 0 ? safe : "codex-backup";
+}
+
+export function createTimestampedBackupPath(prefix = "codex-backup"): string {
+	const storagePath = getStoragePath();
+	const backupDir = join(dirname(storagePath), "backups");
+	const safePrefix = sanitizeBackupPrefix(prefix);
+	const nonce = randomBytes(3).toString("hex");
+	return join(backupDir, `${safePrefix}-${formatBackupTimestamp()}-${nonce}.json`);
+}
+
+async function readAndNormalizeImportFile(filePath: string): Promise<{
+	resolvedPath: string;
+	normalized: AccountStorageV3;
+}> {
+	const resolvedPath = resolvePath(filePath);
+
+	if (!existsSync(resolvedPath)) {
+		throw new Error(`Import file not found: ${resolvedPath}`);
+	}
+
+	const content = await fs.readFile(resolvedPath, "utf-8");
+
+	let imported: unknown;
+	try {
+		imported = JSON.parse(content);
+	} catch {
+		throw new Error(`Invalid JSON in import file: ${resolvedPath}`);
+	}
+
+	const normalized = normalizeAccountStorage(imported);
+	if (!normalized) {
+		throw new Error("Invalid account storage format");
+	}
+
+	return { resolvedPath, normalized };
+}
+
+function analyzeImportedAccounts(
+	existingAccounts: AccountMetadataV3[],
+	importedAccounts: AccountStorageV3["accounts"],
+): ImportPreviewResult & { accounts: AccountMetadataV3[] } {
+	const merged = [...existingAccounts, ...importedAccounts];
+	const accounts = deduplicateAccountsForStorage(merged);
+	if (accounts.length > ACCOUNT_LIMITS.MAX_ACCOUNTS) {
+		throw new Error(
+			`Import would exceed maximum of ${ACCOUNT_LIMITS.MAX_ACCOUNTS} accounts (would have ${accounts.length})`,
+		);
+	}
+	const imported = Math.max(0, accounts.length - existingAccounts.length);
+	const skipped = Math.max(0, importedAccounts.length - imported);
+	return {
+		accounts,
+		imported,
+		total: accounts.length,
+		skipped,
+	};
+}
+
+/**
+ * Import preview/apply analysis is pure in-memory work: it does not touch disk
+ * and it does not log token or workspace values. The surrounding
+ * `withAccountStorageTransaction` caller keeps Windows lock-retry and
+ * serialized read-modify-write behavior; see `test/storage.test.ts` for the
+ * overlapping transaction regression and pre-import backup lock coverage.
+ */
+
+export async function previewImportAccounts(
+	filePath: string,
+): Promise<ImportPreviewResult> {
+	const { normalized } = await readAndNormalizeImportFile(filePath);
+
+	return withAccountStorageTransaction((existing) => {
+		const existingAccounts = existing?.accounts ?? [];
+		const analysis = analyzeImportedAccounts(existingAccounts, normalized.accounts);
+		return Promise.resolve({
+			imported: analysis.imported,
+			total: analysis.total,
+			skipped: analysis.skipped,
+		});
 	});
 }
 
@@ -821,65 +1277,135 @@ export async function exportAccounts(filePath: string, force = true): Promise<vo
 
 /**
  * Imports accounts from a JSON file, merging with existing accounts.
- * Deduplicates by accountId/email, preserving most recently used entries.
+ * Deduplicates by identity key first (organizationId -> accountId -> refreshToken),
+ * then applies legacy email dedupe only to entries without organizationId/accountId.
  * @param filePath - Source file path
  * @throws Error if file is invalid or would exceed MAX_ACCOUNTS
  */
-export async function importAccounts(filePath: string): Promise<{ imported: number; total: number; skipped: number }> {
-  const resolvedPath = resolvePath(filePath);
+export async function importAccounts(
+	filePath: string,
+	options: ImportAccountsOptions = {},
+): Promise<ImportAccountsResult> {
+  const { resolvedPath, normalized } = await readAndNormalizeImportFile(filePath);
+  const backupMode = options.backupMode ?? "none";
+  const backupPrefix = options.preImportBackupPrefix ?? "codex-pre-import-backup";
   
-  // Check file exists with friendly error
-  if (!existsSync(resolvedPath)) {
-    throw new Error(`Import file not found: ${resolvedPath}`);
-  }
-  
-  const content = await fs.readFile(resolvedPath, "utf-8");
-  
-  let imported: unknown;
-  try {
-    imported = JSON.parse(content);
-  } catch {
-    throw new Error(`Invalid JSON in import file: ${resolvedPath}`);
-  }
-  
-  const normalized = normalizeAccountStorage(imported);
-  if (!normalized) {
-    throw new Error("Invalid account storage format");
-  }
-  
-  const { imported: importedCount, total, skipped: skippedCount } =
+  const {
+    imported: importedCount,
+    total,
+    skipped: skippedCount,
+    backupStatus,
+    backupPath,
+    backupError,
+  } =
     await withAccountStorageTransaction(async (existing, persist) => {
-      const existingAccounts = existing?.accounts ?? [];
-      const existingActiveIndex = existing?.activeIndex ?? 0;
+      const existingStorage: AccountStorageV3 =
+        existing ??
+        ({
+          version: 3,
+          accounts: [],
+          activeIndex: 0,
+          activeIndexByFamily: {},
+        } satisfies AccountStorageV3);
+      const existingAccounts = existingStorage.accounts;
+      const existingActiveIndex = existingStorage.activeIndex;
+      const clampedExistingActiveIndex = clampIndex(existingActiveIndex, existingAccounts.length);
+      const existingActiveKeys = extractActiveKeys(existingAccounts, clampedExistingActiveIndex);
+      const existingActiveIndexByFamily = existingStorage.activeIndexByFamily ?? {};
 
-      const merged = [...existingAccounts, ...normalized.accounts];
-
-      if (merged.length > ACCOUNT_LIMITS.MAX_ACCOUNTS) {
-        const deduped = deduplicateAccountsByEmail(deduplicateAccounts(merged));
-        if (deduped.length > ACCOUNT_LIMITS.MAX_ACCOUNTS) {
-          throw new Error(
-            `Import would exceed maximum of ${ACCOUNT_LIMITS.MAX_ACCOUNTS} accounts (would have ${deduped.length})`
-          );
+      let backupStatus: ImportBackupStatus = "skipped";
+      let backupPath: string | undefined;
+      let backupError: string | undefined;
+      let backupLogError: string | undefined;
+      if (backupMode !== "none" && existingAccounts.length > 0) {
+        backupPath = createTimestampedBackupPath(backupPrefix);
+        try {
+          await writePreImportBackupFile(backupPath, existingStorage);
+          backupStatus = "created";
+        } catch (error) {
+          backupStatus = "failed";
+          backupError = error instanceof Error ? error.message : String(error);
+          const backupCode = (error as NodeJS.ErrnoException)?.code;
+          backupLogError = backupCode
+            ? `pre-import backup failed (${backupCode})`
+            : "pre-import backup failed";
+          if (backupMode === "required") {
+            throw new Error(
+              backupCode
+                ? `Pre-import backup failed (${backupCode})`
+                : "Pre-import backup failed",
+            );
+          }
+          log.warn("Pre-import backup failed; continuing import apply", {
+            backupFile: backupPath ? basename(backupPath) : undefined,
+            error: backupLogError,
+          });
         }
       }
 
-      const deduplicatedAccounts = deduplicateAccountsByEmail(deduplicateAccounts(merged));
+      const analysis = analyzeImportedAccounts(existingAccounts, normalized.accounts);
+      const deduplicatedAccounts = analysis.accounts;
+
+      const mappedActiveIndex = (() => {
+        if (deduplicatedAccounts.length === 0) return 0;
+        if (existingActiveKeys.length > 0) {
+          const idx = findAccountIndexByIdentityKeys(deduplicatedAccounts, existingActiveKeys);
+          if (idx >= 0) return idx;
+        }
+        return clampIndex(clampedExistingActiveIndex, deduplicatedAccounts.length);
+      })();
+
+      const activeIndexByFamily: Partial<Record<ModelFamily, number>> = {};
+      for (const family of MODEL_FAMILIES) {
+        const rawFamilyIndex = existingActiveIndexByFamily[family];
+        const familyIndex =
+          typeof rawFamilyIndex === "number" && Number.isFinite(rawFamilyIndex)
+            ? rawFamilyIndex
+            : clampedExistingActiveIndex;
+        const familyKeys = extractActiveKeys(existingAccounts, clampIndex(familyIndex, existingAccounts.length));
+        if (familyKeys.length > 0) {
+          const idx = findAccountIndexByIdentityKeys(deduplicatedAccounts, familyKeys);
+          activeIndexByFamily[family] = idx >= 0 ? idx : mappedActiveIndex;
+          continue;
+        }
+        activeIndexByFamily[family] = mappedActiveIndex;
+      }
 
       const newStorage: AccountStorageV3 = {
         version: 3,
         accounts: deduplicatedAccounts,
-        activeIndex: existingActiveIndex,
-        activeIndexByFamily: existing?.activeIndexByFamily,
+        activeIndex: mappedActiveIndex,
+        activeIndexByFamily,
       };
 
       await persist(newStorage);
 
-      const imported = deduplicatedAccounts.length - existingAccounts.length;
-      const skipped = normalized.accounts.length - imported;
-      return { imported, total: deduplicatedAccounts.length, skipped };
+      return {
+        imported: analysis.imported,
+        total: analysis.total,
+        skipped: analysis.skipped,
+        backupStatus,
+        backupPath,
+        backupError,
+      };
     });
 
-  log.info("Imported accounts", { path: resolvedPath, imported: importedCount, skipped: skippedCount, total });
+  log.info("Imported accounts", {
+    path: resolvedPath,
+    imported: importedCount,
+    skipped: skippedCount,
+    total,
+    backupStatus,
+    backupFile: backupPath ? basename(backupPath) : undefined,
+    backupError: backupError ? "available on command result" : undefined,
+  });
 
-  return { imported: importedCount, total, skipped: skippedCount };
+  return {
+    imported: importedCount,
+    total,
+    skipped: skippedCount,
+    backupStatus,
+    backupPath,
+    backupError,
+  };
 }

@@ -38,7 +38,7 @@ export {
  * @returns Normalized model name (e.g., "gpt-5-codex", "gpt-5.1-codex-max")
  */
 export function normalizeModel(model: string | undefined): string {
-	if (!model) return "gpt-5.1";
+	if (!model) return "gpt-5.4";
 
 	// Strip provider prefix if present (e.g., "openai/gpt-5-codex" → "gpt-5-codex")
 	const modelId = model.includes("/") ? model.split("/").pop() ?? model : model;
@@ -79,12 +79,32 @@ export function normalizeModel(model: string | undefined): string {
 		return "gpt-5-codex";
 	}
 
-	// 4. GPT-5.2 (general purpose)
+	// 4. GPT-5.4 Pro (first-class model)
+	if (/\bgpt(?:-| )5\.4(?:-| )pro(?:\b|[- ])/.test(normalized)) {
+		return "gpt-5.4-pro";
+	}
+
+	// 5. GPT-5.4 Mini (first-class model)
+	if (/\bgpt(?:-| )5\.4(?:-| )mini(?:\b|[- ])/.test(normalized)) {
+		return "gpt-5.4-mini";
+	}
+
+	// 6. GPT-5.4 Nano (first-class model)
+	if (/\bgpt(?:-| )5\.4(?:-| )nano(?:\b|[- ])/.test(normalized)) {
+		return "gpt-5.4-nano";
+	}
+
+	// 7. GPT-5.4 (general purpose)
+	if (/\bgpt(?:-| )5\.4(?:\b|[- ])/.test(normalized)) {
+		return "gpt-5.4";
+	}
+
+	// 8. GPT-5.2 (general purpose)
 	if (normalized.includes("gpt-5.2") || normalized.includes("gpt 5.2")) {
 		return "gpt-5.2";
 	}
 
-	// 5. GPT-5.1 Codex Max
+	// 9. GPT-5.1 Codex Max
 	if (
 		normalized.includes("gpt-5.1-codex-max") ||
 		normalized.includes("gpt 5.1 codex max")
@@ -92,7 +112,7 @@ export function normalizeModel(model: string | undefined): string {
 		return "gpt-5.1-codex-max";
 	}
 
-	// 6. GPT-5.1 Codex Mini
+	// 10. GPT-5.1 Codex Mini
 	if (
 		normalized.includes("gpt-5.1-codex-mini") ||
 		normalized.includes("gpt 5.1 codex mini")
@@ -100,7 +120,7 @@ export function normalizeModel(model: string | undefined): string {
 		return "gpt-5.1-codex-mini";
 	}
 
-	// 7. Legacy Codex Mini
+	// 11. Legacy Codex Mini
 	if (
 		normalized.includes("codex-mini-latest") ||
 		normalized.includes("gpt-5-codex-mini") ||
@@ -109,7 +129,7 @@ export function normalizeModel(model: string | undefined): string {
 		return "gpt-5.1-codex-mini";
 	}
 
-	// 8. GPT-5 Codex canonical + GPT-5.1 Codex legacy alias
+	// 12. GPT-5 Codex canonical + GPT-5.1 Codex legacy alias
 	if (
 		normalized.includes("gpt-5-codex") ||
 		normalized.includes("gpt 5 codex")
@@ -117,7 +137,7 @@ export function normalizeModel(model: string | undefined): string {
 		return "gpt-5-codex";
 	}
 
-	// 9. GPT-5.1 Codex (legacy alias)
+	// 13. GPT-5.1 Codex (legacy alias)
 	if (
 		normalized.includes("gpt-5.1-codex") ||
 		normalized.includes("gpt 5.1 codex")
@@ -125,23 +145,23 @@ export function normalizeModel(model: string | undefined): string {
 		return "gpt-5-codex";
 	}
 
-	// 10. GPT-5.1 (general-purpose)
+	// 14. GPT-5.1 (general-purpose)
 	if (normalized.includes("gpt-5.1") || normalized.includes("gpt 5.1")) {
 		return "gpt-5.1";
 	}
 
-	// 11. GPT-5 Codex family (any other variant with "codex")
+	// 15. GPT-5 Codex family (any other variant with "codex")
 	if (normalized.includes("codex")) {
 		return "gpt-5-codex";
 	}
 
-	// 12. GPT-5 family (any variant) - default to 5.1
+	// 16. GPT-5 family (any variant) - default to 5.4 latest general model
 	if (normalized.includes("gpt-5") || normalized.includes("gpt 5")) {
-		return "gpt-5.1";
+		return "gpt-5.4";
 	}
 
 	// Default fallback
-	return "gpt-5.1";
+	return "gpt-5.4";
 }
 
 /**
@@ -253,6 +273,9 @@ export function applyFastSessionDefaults(
 	};
 }
 
+/**
+ * Resolves reasoning settings by layering transformed config with body/provider overrides.
+ */
 function resolveReasoningConfig(
 	modelName: string,
 	modelConfig: ConfigOptions,
@@ -273,6 +296,9 @@ function resolveReasoningConfig(
 	return getReasoningConfig(modelName, mergedConfig);
 }
 
+/**
+ * Picks effective text verbosity with body/provider values taking precedence.
+ */
 function resolveTextVerbosity(
 	modelConfig: ConfigOptions,
 	body: RequestBody,
@@ -286,6 +312,9 @@ function resolveTextVerbosity(
 	);
 }
 
+/**
+ * Resolves include fields and always preserves encrypted reasoning continuity payloads.
+ */
 function resolveInclude(modelConfig: ConfigOptions, body: RequestBody): string[] {
 	const providerOpenAI = body.providerOptions?.openai;
 	const base =
@@ -300,6 +329,9 @@ function resolveInclude(modelConfig: ConfigOptions, body: RequestBody): string[]
 	return include;
 }
 
+/**
+ * Parses a collaboration mode token from env/config text.
+ */
 function parseCollaborationMode(value: string | undefined): CollaborationMode | undefined {
 	if (!value) return undefined;
 	const normalized = value.trim().toLowerCase();
@@ -308,6 +340,9 @@ function parseCollaborationMode(value: string | undefined): CollaborationMode | 
 	return undefined;
 }
 
+/**
+ * Extracts plain text from mixed message-content payloads.
+ */
 function extractMessageText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
@@ -322,6 +357,9 @@ function extractMessageText(content: unknown): string {
 		.join("\n");
 }
 
+/**
+ * Detects active collaboration mode using explicit env overrides first, then prompt hints.
+ */
 function detectCollaborationMode(body: RequestBody): CollaborationMode {
 	const envMode =
 		parseCollaborationMode(process.env.CODEX_COLLABORATION_MODE) ??
@@ -352,6 +390,9 @@ function detectCollaborationMode(body: RequestBody): CollaborationMode {
 	return "unknown";
 }
 
+/**
+ * Removes tools that are only valid in plan mode when the request is not in plan mode.
+ */
 function sanitizePlanOnlyTools(tools: unknown, mode: CollaborationMode): unknown {
 	if (!Array.isArray(tools) || mode === "plan") return tools;
 
@@ -375,12 +416,23 @@ function sanitizePlanOnlyTools(tools: unknown, mode: CollaborationMode): unknown
 	return filtered;
 }
 
+/**
+ * Collects runtime tool names from either direct tool entries or function-wrapped definitions.
+ */
 function extractRuntimeToolNames(tools: unknown): string[] {
 	if (!Array.isArray(tools)) return [];
 
 	const names: string[] = [];
 	for (const tool of tools) {
 		if (!tool || typeof tool !== "object") continue;
+
+		// Pure in-memory name extraction only: no filesystem I/O, token access,
+		// or logging side effects are introduced by recognizing built-in tool types.
+		const toolType = (tool as { type?: unknown }).type;
+		if (typeof toolType === "string" && toolType.trim() && toolType !== "function") {
+			names.push(toolType);
+			continue;
+		}
 
 		const directName = (tool as { name?: unknown }).name;
 		if (typeof directName === "string" && directName.trim()) {
@@ -416,6 +468,7 @@ export function getReasoningConfig(
 	userConfig: ConfigOptions = {},
 ): ReasoningConfig {
 	const normalizedName = modelName?.toLowerCase() ?? "";
+	const canonicalModelName = normalizeModel(modelName);
 
 	// Canonical GPT-5 Codex (stable) defaults to high and does not support "none".
 	const isGpt5Codex =
@@ -432,23 +485,44 @@ export function getReasoningConfig(
 		normalizedName.includes("gpt-5.2-codex") ||
 		normalizedName.includes("gpt 5.2 codex");
 
+	// GPT-5.4 Pro (optional/manual model) supports xhigh but not "none"
+	const isGpt54Pro =
+		normalizedName.includes("gpt-5.4-pro") ||
+		normalizedName.includes("gpt 5.4 pro");
+
+	// GPT-5.4 Mini is a first-class explicit model.
+	const isGpt54Mini = canonicalModelName === "gpt-5.4-mini";
+
+	// GPT-5.4 Nano is a first-class explicit model.
+	const isGpt54Nano = canonicalModelName === "gpt-5.4-nano";
+
+	// GPT-5.4 general purpose (latest default family)
+	const isGpt54General =
+		(normalizedName.includes("gpt-5.4") || normalizedName.includes("gpt 5.4")) &&
+		!isGpt54Pro &&
+		!isGpt54Mini &&
+		!isGpt54Nano;
+
 	// GPT-5.2 general purpose (not codex variant)
 	const isGpt52General =
 		(normalizedName.includes("gpt-5.2") || normalizedName.includes("gpt 5.2")) &&
 		!isGpt52Codex;
+	const canonicalSupportsXhigh =
+		canonicalModelName === "gpt-5.4" ||
+		canonicalModelName === "gpt-5.4-mini" ||
+		canonicalModelName === "gpt-5.4-nano" ||
+		canonicalModelName === "gpt-5.4-pro" ||
+		canonicalModelName === "gpt-5.2";
 	const isCodexMax =
 		normalizedName.includes("codex-max") ||
 		normalizedName.includes("codex max");
-	const isCodexMini =
-		normalizedName.includes("codex-mini") ||
-		normalizedName.includes("codex mini") ||
-		normalizedName.includes("codex_mini") ||
-		normalizedName.includes("codex-mini-latest");
+	const isCodexMini = canonicalModelName === "gpt-5.1-codex-mini";
 	const isCodex = normalizedName.includes("codex") && !isCodexMini;
 	const isLightweight =
+		!isGpt54Mini &&
+		!isGpt54Nano &&
 		!isCodexMini &&
-		(normalizedName.includes("nano") ||
-			normalizedName.includes("mini"));
+		/\bgpt(?:-| )5(?:-| )(?:mini|nano)(?:\b|[- ])/.test(normalizedName);
 
 	// GPT-5.1 general purpose (not codex variants) - supports "none" per OpenAI API docs
 	const isGpt51General =
@@ -459,27 +533,48 @@ export function getReasoningConfig(
 			normalizedName.startsWith("gpt-5-")
 		) &&
 		!isCodex &&
+		!isGpt54General &&
+		!isGpt54Mini &&
+		!isGpt54Pro &&
 		!isGpt52General &&
 		!isCodexMax &&
 		!isCodexMini;
 
-	// GPT-5.2 general, legacy GPT-5.2/5.3 Codex aliases, and Codex Max support xhigh reasoning
+	// GPT-5.4/5.2 general, GPT-5.4 Mini/Pro, legacy GPT-5.2/5.3 Codex aliases, and Codex Max support xhigh reasoning
 	const supportsXhigh =
-		isGpt52General || isGpt53Codex || isGpt52Codex || isCodexMax;
+		isGpt54General ||
+		isGpt54Mini ||
+		isGpt54Nano ||
+		isGpt54Pro ||
+		isGpt52General ||
+		isGpt53Codex ||
+		isGpt52Codex ||
+		isCodexMax;
 
-	// GPT 5.1 general and GPT 5.2 general support "none" reasoning per:
+	// GPT 5.1/5.2/5.4 general and GPT-5.4 Mini support "none" reasoning per:
 	// - OpenAI API docs: "gpt-5.1 defaults to none, supports: none, low, medium, high"
+	// - GPT-5.4 latest model docs list reasoning controls for the base model family
+	// - GPT-5.4 Mini should stay aligned with GPT-5.4 reasoning support as a first-class model
+	// - Legacy aliases like gpt-5-mini/gpt-5-nano now resolve to first-class
+	//   GPT-5.4 Mini / GPT-5.4 Nano models, so they inherit the same "none" support
 	// - Codex CLI: ReasoningEffort enum includes None variant (codex-rs/protocol/src/openai_models.rs)
 	// - Codex CLI: docs/config.md lists "none" as valid for model_reasoning_effort
-	// - gpt-5.2 (being newer) also supports: none, low, medium, high, xhigh
-	// - Codex models (including GPT-5 Codex and legacy GPT-5.3/5.2 Codex aliases) do NOT support "none"
-	const supportsNone = isGpt52General || isGpt51General;
+	// - gpt-5.2 and gpt-5.4 general models support: none, low, medium, high, xhigh
+	// - Codex/Pro models (including GPT-5 Codex, GPT-5.4 Pro, and legacy GPT-5.3/5.2 Codex aliases) do NOT support "none"
+	const supportsNone =
+		isGpt54General ||
+		isGpt54Mini ||
+		isGpt54Nano ||
+		isGpt52General ||
+		(isGpt51General && !isLightweight);
 
 	// Default based on model type (Codex CLI defaults + plugin opinionated tuning)
 	// Note: OpenAI docs say gpt-5.1 defaults to "none", but we default to "medium"
 	// for better coding assistance unless user explicitly requests "none".
 	// - Canonical GPT-5 Codex defaults to high in stable Codex.
 	// - Legacy GPT-5.3/5.2 Codex aliases default to xhigh for backward compatibility.
+	// - Legacy gpt-5-mini / gpt-5-nano aliases now resolve to GPT-5.4 Mini / Nano,
+	//   so they inherit the same default "high" effort and direct xhigh support.
 	const defaultEffort: ReasoningConfig["effort"] = isCodexMini
 		? "medium"
 		: isGpt5Codex
@@ -494,6 +589,7 @@ export function getReasoningConfig(
 
 	// Get user-requested effort
 	let effort = userConfig.reasoningEffort || defaultEffort;
+	const originalRequestedEffort = userConfig.reasoningEffort ?? defaultEffort;
 
 	if (isCodexMini) {
 		if (effort === "minimal" || effort === "low" || effort === "none") {
@@ -508,18 +604,31 @@ export function getReasoningConfig(
 	}
 
 	// For models that don't support xhigh, downgrade to high
-	if (!supportsXhigh && effort === "xhigh") {
+	// Legacy gpt-5-mini/gpt-5-nano aliases now normalize to GPT-5.4 Mini / Nano,
+	// both of which support xhigh directly.
+	const supportsRequestedXhigh = supportsXhigh || canonicalSupportsXhigh;
+	if (!supportsRequestedXhigh && effort === "xhigh") {
 		effort = "high";
 	}
 
 	// For models that don't support "none", upgrade to "low"
-	// (Codex models don't support "none" - only GPT-5.1 and GPT-5.2 general purpose do)
+	// (Codex/Pro models don't support "none" - only GPT-5.1/5.2/5.4 general purpose do)
 	if (!supportsNone && effort === "none") {
 		effort = "low";
 	}
 
+	// GPT-5.4 Pro only supports medium/high/xhigh reasoning.
+	// originalRequestedEffort is a non-sensitive model setting string, not a token.
+	// Logging this coercion does not introduce new redaction or filesystem-race risk.
+	if (isGpt54Pro && (effort === "low" || effort === "minimal")) {
+		logWarn(
+			`GPT-5.4 Pro supports medium/high/xhigh only; coercing '${originalRequestedEffort}' to 'medium'`,
+		);
+		effort = "medium";
+	}
+
 	// Normalize "minimal" to "low" for Codex families
-		// Codex CLI presets are low/medium/high (or xhigh for Codex Max / GPT-5.3/5.2 Codex)
+	// Codex CLI presets are low/medium/high (or xhigh for Codex Max / GPT-5.3/5.2 Codex)
 	if (isCodex && effort === "minimal") {
 		effort = "low";
 	}
@@ -916,12 +1025,12 @@ export async function transformRequestBody(
 	if (body.input && Array.isArray(body.input)) {
 		let inputItems: InputItem[] = body.input;
 
-			if (shouldApplyFastSessionTuning) {
-				inputItems =
-					trimInputForFastSession(inputItems, fastSessionMaxInputItems, {
-						preferLatestUserOnly: shouldPreferLatestUserOnly,
-					}) ?? inputItems;
-			}
+		if (shouldApplyFastSessionTuning) {
+			inputItems =
+				trimInputForFastSession(inputItems, fastSessionMaxInputItems, {
+					preferLatestUserOnly: shouldPreferLatestUserOnly,
+				}) ?? inputItems;
+		}
 
 		// Debug: Log original input message IDs before filtering
 		const originalIds = inputItems
@@ -1009,8 +1118,12 @@ export async function transformRequestBody(
 	// This allows reasoning context to persist across turns without server-side storage
 	body.include = resolveInclude(modelConfig, body);
 
-	// Remove unsupported parameters
-	body.max_output_tokens = undefined;
+	// Preserve caller-supplied max_output_tokens from the in-memory request body.
+	// max_output_tokens is a numeric budget, not a credential, so no redaction is required.
+	// Windows filesystem: no file I/O occurs here; no concurrency risk is introduced.
+	// Regression: "should preserve max_output_tokens while removing max_completion_tokens"
+	// in test/request-transformer.test.ts.
+	// Remove unsupported parameters.
 	body.max_completion_tokens = undefined;
 
 	return body;

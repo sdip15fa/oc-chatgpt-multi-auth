@@ -11,6 +11,22 @@
  * Key: The model ID as specified in opencode.json config
  * Value: The normalized model name to send to the API
  */
+const DATED_ALIAS_EFFORT_SUFFIXES = [
+	"",
+	"-none",
+	"-low",
+	"-medium",
+	"-high",
+	"-xhigh",
+] as const;
+const GPT_54_SNAPSHOT_DATE = "2026-03-05" as const;
+
+function expandDatedAliases(prefix: string, target: string): Record<string, string> {
+	return Object.fromEntries(
+		DATED_ALIAS_EFFORT_SUFFIXES.map((suffix) => [`${prefix}${suffix}`, target]),
+	);
+}
+
 export const MODEL_MAP: Record<string, string> = {
 	// ============================================================================
 	// GPT-5 Codex Models (canonical stable family)
@@ -57,6 +73,48 @@ export const MODEL_MAP: Record<string, string> = {
 	"gpt-5.1-codex-max-medium": "gpt-5.1-codex-max",
 	"gpt-5.1-codex-max-high": "gpt-5.1-codex-max",
 	"gpt-5.1-codex-max-xhigh": "gpt-5.1-codex-max",
+
+	// ============================================================================
+	// GPT-5.4 Models (latest general-purpose family)
+	// ============================================================================
+	"gpt-5.4": "gpt-5.4",
+	"gpt-5.4-none": "gpt-5.4",
+	"gpt-5.4-low": "gpt-5.4",
+	"gpt-5.4-medium": "gpt-5.4",
+	"gpt-5.4-high": "gpt-5.4",
+	"gpt-5.4-xhigh": "gpt-5.4",
+	...expandDatedAliases(`gpt-5.4-${GPT_54_SNAPSHOT_DATE}`, "gpt-5.4"),
+
+	// ============================================================================
+	// GPT-5.4 Pro Models (optional/manual config)
+	// ============================================================================
+	"gpt-5.4-pro": "gpt-5.4-pro",
+	"gpt-5.4-pro-medium": "gpt-5.4-pro",
+	"gpt-5.4-pro-high": "gpt-5.4-pro",
+	"gpt-5.4-pro-xhigh": "gpt-5.4-pro",
+	...expandDatedAliases(`gpt-5.4-pro-${GPT_54_SNAPSHOT_DATE}`, "gpt-5.4-pro"),
+
+	// ============================================================================
+	// GPT-5.4 Mini Models (latest efficient family)
+	// ============================================================================
+	"gpt-5.4-mini": "gpt-5.4-mini",
+	"gpt-5.4-mini-none": "gpt-5.4-mini",
+	"gpt-5.4-mini-low": "gpt-5.4-mini",
+	"gpt-5.4-mini-medium": "gpt-5.4-mini",
+	"gpt-5.4-mini-high": "gpt-5.4-mini",
+	"gpt-5.4-mini-xhigh": "gpt-5.4-mini",
+	...expandDatedAliases(`gpt-5.4-mini-${GPT_54_SNAPSHOT_DATE}`, "gpt-5.4-mini"),
+
+	// ============================================================================
+	// GPT-5.4 Nano Models (lightweight efficient family)
+	// ============================================================================
+	"gpt-5.4-nano": "gpt-5.4-nano",
+	"gpt-5.4-nano-none": "gpt-5.4-nano",
+	"gpt-5.4-nano-low": "gpt-5.4-nano",
+	"gpt-5.4-nano-medium": "gpt-5.4-nano",
+	"gpt-5.4-nano-high": "gpt-5.4-nano",
+	"gpt-5.4-nano-xhigh": "gpt-5.4-nano",
+	...expandDatedAliases(`gpt-5.4-nano-${GPT_54_SNAPSHOT_DATE}`, "gpt-5.4-nano"),
 
 	// ============================================================================
 	// GPT-5.2 Models (supports none/low/medium/high/xhigh per OpenAI API docs)
@@ -108,11 +166,11 @@ export const MODEL_MAP: Record<string, string> = {
 	"gpt-5-codex-mini-high": "gpt-5.1-codex-mini",
 
 	// ============================================================================
-	// GPT-5 General Purpose Models (LEGACY - maps to gpt-5.1 as gpt-5 is being phased out)
+	// GPT-5 General Purpose Models (LEGACY - maps to gpt-5.4 latest)
 	// ============================================================================
-	"gpt-5": "gpt-5.1",
-	"gpt-5-mini": "gpt-5.1",
-	"gpt-5-nano": "gpt-5.1",
+	"gpt-5": "gpt-5.4",
+	"gpt-5-mini": "gpt-5.4-mini",
+	"gpt-5-nano": "gpt-5.4-nano",
 };
 
 /**

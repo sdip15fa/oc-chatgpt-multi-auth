@@ -1,14 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { promises as fs, existsSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { 
+import {
   deduplicateAccounts,
   deduplicateAccountsByEmail,
   normalizeAccountStorage, 
   loadAccounts, 
   saveAccounts,
   clearAccounts,
+  loadFlaggedAccounts,
+  saveFlaggedAccounts,
   getStoragePath,
   setStoragePath,
   setStoragePathDirect,
@@ -16,15 +18,45 @@ import {
   formatStorageErrorHint,
   exportAccounts,
   importAccounts,
+  previewImportAccounts,
+  createTimestampedBackupPath,
+  getWorkspaceIdentityKey,
   withAccountStorageTransaction,
+  withFlaggedAccountStorageTransaction,
 } from "../lib/storage.js";
 
-// Mocking the behavior we're about to implement for TDD
-// Since the functions aren't in lib/storage.ts yet, we'll need to mock them or 
-// accept that this test won't even compile/run until we add them.
-// But Task 0 says: "Tests should fail initially (RED phase)"
-
 describe("storage", () => {
+  describe("getWorkspaceIdentityKey", () => {
+    it("uses organizationId and accountId when both are present", () => {
+      expect(
+        getWorkspaceIdentityKey({
+          organizationId: " org-shared ",
+          accountId: " workspace-a ",
+          refreshToken: " refresh-a ",
+        }),
+      ).toBe("organizationId:org-shared|accountId:workspace-a");
+    });
+
+    it("falls back to accountId when organizationId is missing", () => {
+      expect(
+        getWorkspaceIdentityKey({
+          accountId: " workspace-only ",
+          refreshToken: " refresh-b ",
+        }),
+      ).toBe("accountId:workspace-only");
+    });
+
+    it("falls back to refreshToken when workspace ids are missing", () => {
+      expect(
+        getWorkspaceIdentityKey({
+          organizationId: "   ",
+          accountId: "",
+          refreshToken: " refresh-c ",
+        }),
+      ).toBe("refreshToken:refresh-c");
+    });
+  });
+
   describe("deduplication", () => {
     it("remaps activeIndex after deduplication using active account key", () => {
       const now = Date.now();
@@ -104,59 +136,461 @@ describe("storage", () => {
     });
 
     it("should export accounts to a file", async () => {
-      // @ts-ignore - exportAccounts doesn't exist yet
-      const { exportAccounts } = await import("../lib/storage.js");
-      
       const storage = {
         version: 3,
         activeIndex: 0,
         accounts: [{ accountId: "test", refreshToken: "ref", addedAt: 1, lastUsed: 2 }]
       };
-      // @ts-ignore
       await saveAccounts(storage);
-      
-      // @ts-ignore
+
       await exportAccounts(exportPath);
-      
+
       expect(existsSync(exportPath)).toBe(true);
       const exported = JSON.parse(await fs.readFile(exportPath, "utf-8"));
       expect(exported.accounts[0].accountId).toBe("test");
     });
 
     it("should fail export if file exists and force is false", async () => {
-      // @ts-ignore
-      const { exportAccounts } = await import("../lib/storage.js");
       await fs.writeFile(exportPath, "exists");
-      
-      // @ts-ignore
+
       await expect(exportAccounts(exportPath, false)).rejects.toThrow(/already exists/);
     });
 
     it("should import accounts from a file and merge", async () => {
-      // @ts-ignore
-      const { importAccounts } = await import("../lib/storage.js");
-      
       const existing = {
         version: 3,
         activeIndex: 0,
         accounts: [{ accountId: "existing", refreshToken: "ref1", addedAt: 1, lastUsed: 2 }]
       };
-      // @ts-ignore
       await saveAccounts(existing);
-      
+
       const toImport = {
         version: 3,
         activeIndex: 0,
         accounts: [{ accountId: "new", refreshToken: "ref2", addedAt: 3, lastUsed: 4 }]
       };
       await fs.writeFile(exportPath, JSON.stringify(toImport));
-      
-      // @ts-ignore
+
       await importAccounts(exportPath);
-      
+
       const loaded = await loadAccounts();
       expect(loaded?.accounts).toHaveLength(2);
       expect(loaded?.accounts.map(a => a.accountId)).toContain("new");
+    });
+
+    it("should preview import results without applying changes", async () => {
+      await saveAccounts({
+        version: 3,
+        activeIndex: 0,
+        accounts: [{ accountId: "existing", refreshToken: "ref1", addedAt: 1, lastUsed: 2 }],
+      });
+
+      await fs.writeFile(
+        exportPath,
+        JSON.stringify({
+          version: 3,
+          activeIndex: 0,
+          accounts: [{ accountId: "preview", refreshToken: "ref2", addedAt: 3, lastUsed: 4 }],
+        }),
+      );
+
+      const preview = await previewImportAccounts(exportPath);
+      expect(preview.imported).toBe(1);
+      expect(preview.skipped).toBe(0);
+      expect(preview.total).toBe(2);
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(1);
+      expect(loaded?.accounts[0]?.accountId).toBe("existing");
+    });
+
+    it("keeps preview and apply counts aligned for the same import fixture", async () => {
+      await saveAccounts({
+        version: 3,
+        activeIndex: 0,
+        accounts: [{ accountId: "existing", refreshToken: "ref1", addedAt: 1, lastUsed: 2 }],
+      });
+
+      await fs.writeFile(
+        exportPath,
+        JSON.stringify({
+          version: 3,
+          activeIndex: 0,
+          accounts: [{ accountId: "preview", refreshToken: "ref2", addedAt: 3, lastUsed: 4 }],
+        }),
+      );
+
+      const preview = await previewImportAccounts(exportPath);
+      const applied = await importAccounts(exportPath);
+
+      expect(preview).toMatchObject({
+        imported: applied.imported,
+        skipped: applied.skipped,
+        total: applied.total,
+      });
+    });
+
+    it("creates timestamped backup paths in storage backups directory", () => {
+      const path = createTimestampedBackupPath();
+      const expectedBackupDir = join(dirname(testStoragePath), "backups");
+      expect(dirname(path)).toBe(expectedBackupDir);
+      expect(basename(path)).toMatch(/^codex-backup-\d{8}-\d{9}-[a-f0-9]{6}\.json$/);
+      expect(path.endsWith(".json")).toBe(true);
+    });
+
+    it("sanitizes backup filename prefix to prevent unsafe path fragments", () => {
+      const path = createTimestampedBackupPath("../unsafe/../name");
+      expect(basename(path)).toMatch(/^unsafe-name-\d{8}-\d{9}-[a-f0-9]{6}\.json$/);
+    });
+
+    it("preserves accounts with different accountId values even when refreshToken and email are shared (no organizationId)", async () => {
+      await saveAccounts({
+        version: 3,
+        activeIndex: 0,
+        activeIndexByFamily: { codex: 0, "gpt-5.1": 0 },
+        accounts: [
+          {
+            accountId: "workspace-a",
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            addedAt: 1,
+            lastUsed: 1,
+          },
+        ],
+      });
+
+      await fs.writeFile(
+        exportPath,
+        JSON.stringify({
+          version: 3,
+          activeIndex: 0,
+          accounts: [
+            {
+              accountId: "workspace-b",
+              refreshToken: "shared-refresh",
+              email: "user@example.com",
+              addedAt: 2,
+              lastUsed: 2,
+            },
+          ],
+        }),
+      );
+
+      const preview = await previewImportAccounts(exportPath);
+      expect(preview.imported).toBe(1);
+      expect(preview.skipped).toBe(0);
+      expect(preview.total).toBe(2);
+
+      await importAccounts(exportPath);
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(2);
+      const accountIds = loaded?.accounts.map((account) => account.accountId);
+      expect(accountIds).toContain("workspace-a");
+      expect(accountIds).toContain("workspace-b");
+      expect(loaded?.activeIndex).toBe(0);
+      expect(loaded?.activeIndexByFamily?.codex).toBe(0);
+    });
+
+    it("retains per-account rate-limit and cooldown metadata through save/load round-trip", async () => {
+      await saveAccounts({
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            organizationId: "org-1",
+            accountId: "workspace-org",
+            accountIdSource: "org",
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            addedAt: 100,
+            lastUsed: 200,
+            rateLimitResetTimes: {
+              codex: 1_111,
+              "codex:gpt-5.2": 2_222,
+            },
+            coolingDownUntil: 3_333,
+            cooldownReason: "auth-failure",
+          },
+          {
+            accountId: "workspace-token",
+            accountIdSource: "token",
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            addedAt: 101,
+            lastUsed: 201,
+            rateLimitResetTimes: {
+              "gpt-5.1": 4_444,
+            },
+            coolingDownUntil: 5_555,
+            cooldownReason: "network-error",
+          },
+        ],
+      });
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(2);
+
+      const orgVariant = loaded?.accounts.find((account) => account.accountId === "workspace-org");
+      expect(orgVariant?.rateLimitResetTimes?.codex).toBe(1_111);
+      expect(orgVariant?.rateLimitResetTimes?.["codex:gpt-5.2"]).toBe(2_222);
+      expect(orgVariant?.coolingDownUntil).toBe(3_333);
+      expect(orgVariant?.cooldownReason).toBe("auth-failure");
+
+      const tokenVariant = loaded?.accounts.find((account) => account.accountId === "workspace-token");
+      expect(tokenVariant?.rateLimitResetTimes?.["gpt-5.1"]).toBe(4_444);
+      expect(tokenVariant?.coolingDownUntil).toBe(5_555);
+      expect(tokenVariant?.cooldownReason).toBe("network-error");
+      expect(tokenVariant?.refreshToken).toBe("shared-refresh");
+    });
+
+    it("collapses same-organization records to newest during import and remaps active keys", async () => {
+      await saveAccounts({
+        version: 3,
+        activeIndex: 0,
+        activeIndexByFamily: { codex: 0, "gpt-5.1": 0 },
+        accounts: [
+          {
+            organizationId: "org-1",
+            accountId: "workspace-a",
+            refreshToken: "refresh-old",
+            email: "user@example.com",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+          {
+            organizationId: "org-2",
+            accountId: "workspace-b",
+            refreshToken: "refresh-org-2",
+            email: "user@example.com",
+            addedAt: 2,
+            lastUsed: 20,
+          },
+        ],
+      });
+
+      await fs.writeFile(
+        exportPath,
+        JSON.stringify({
+          version: 3,
+          activeIndex: 0,
+          accounts: [
+            {
+              organizationId: "org-1",
+              accountId: "workspace-c",
+              refreshToken: "refresh-new",
+              email: "user@example.com",
+              addedAt: 3,
+              lastUsed: 30,
+            },
+          ],
+        }),
+      );
+
+      await importAccounts(exportPath);
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(2);
+
+      const org1 = loaded?.accounts.find((account) => account.organizationId === "org-1");
+      expect(org1?.accountId).toBe("workspace-c");
+      expect(org1?.refreshToken).toBe("refresh-new");
+      expect(loaded?.activeIndex).toBe(1);
+      expect(loaded?.activeIndexByFamily?.codex).toBe(1);
+      expect(loaded?.activeIndexByFamily?.["gpt-5.1"]).toBe(1);
+    });
+
+    it("preserves same refresh token across different organizationId values during import", async () => {
+      await fs.writeFile(
+        exportPath,
+        JSON.stringify({
+          version: 3,
+          activeIndex: 0,
+          accounts: [
+            {
+              organizationId: "org-a",
+              accountId: "shared-account",
+              refreshToken: "shared-refresh",
+              addedAt: 1,
+              lastUsed: 1,
+            },
+            {
+              organizationId: "org-b",
+              accountId: "shared-account",
+              refreshToken: "shared-refresh",
+              addedAt: 2,
+              lastUsed: 2,
+            },
+          ],
+        }),
+      );
+
+      await importAccounts(exportPath);
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(2);
+      expect(loaded?.accounts.every((account) => account.refreshToken === "shared-refresh")).toBe(true);
+      const organizationIds = loaded?.accounts
+        .map((account) => account.organizationId)
+        .filter((organizationId): organizationId is string => typeof organizationId === "string");
+      expect(new Set(organizationIds)).toEqual(new Set(["org-a", "org-b"]));
+    });
+
+    it("does not merge accounts when one has organizationId and the other does not, despite same refreshToken", async () => {
+      await saveAccounts({
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            organizationId: "org-scoped",
+            accountId: "workspace-with-org",
+            refreshToken: "shared-refresh-token",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+        ],
+      });
+
+      await fs.writeFile(
+        exportPath,
+        JSON.stringify({
+          version: 3,
+          activeIndex: 0,
+          accounts: [
+            {
+              organizationId: undefined,
+              accountId: "workspace-no-org",
+              refreshToken: "shared-refresh-token",
+              addedAt: 2,
+              lastUsed: 20,
+            },
+          ],
+        }),
+      );
+
+      await importAccounts(exportPath);
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(2);
+
+      const orgScoped = loaded?.accounts.find((account) => account.organizationId === "org-scoped");
+      expect(orgScoped).toBeDefined();
+      expect(orgScoped?.accountId).toBe("workspace-with-org");
+
+      const noOrg = loaded?.accounts.find(
+        (account) =>
+          typeof account.organizationId === "undefined" &&
+          account.accountId === "workspace-no-org",
+      );
+      expect(noOrg).toBeDefined();
+    });
+
+    it("keeps legacy no-organization dedupe semantics during import", async () => {
+      await saveAccounts({
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            accountId: "legacy-account",
+            refreshToken: "legacy-old",
+            email: "legacy-account@example.com",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+          {
+            refreshToken: "legacy-email-old",
+            email: "legacy-email@example.com",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+          {
+            refreshToken: "legacy-refresh",
+            email: "refresh-a@example.com",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+        ],
+      });
+
+      await fs.writeFile(
+        exportPath,
+        JSON.stringify({
+          version: 3,
+          activeIndex: 0,
+          accounts: [
+            {
+              accountId: "legacy-account",
+              refreshToken: "legacy-new",
+              email: "legacy-account@example.com",
+              addedAt: 2,
+              lastUsed: 20,
+            },
+            {
+              refreshToken: "legacy-email-new",
+              email: "legacy-email@example.com",
+              addedAt: 2,
+              lastUsed: 20,
+            },
+            {
+              refreshToken: "legacy-refresh",
+              email: "refresh-b@example.com",
+              addedAt: 2,
+              lastUsed: 20,
+            },
+          ],
+        }),
+      );
+
+      await importAccounts(exportPath);
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(3);
+
+      const byAccountId = loaded?.accounts.find((account) => account.accountId === "legacy-account");
+      expect(byAccountId?.refreshToken).toBe("legacy-new");
+
+      const byEmail = loaded?.accounts.find((account) => account.email === "legacy-email@example.com");
+      expect(byEmail?.refreshToken).toBe("legacy-email-new");
+
+      const byRefresh = loaded?.accounts.find((account) => account.refreshToken === "legacy-refresh");
+      expect(byRefresh?.email).toBe("refresh-b@example.com");
+    });
+
+    it("deduplicates legacy no-accountId records by email during import", async () => {
+      await saveAccounts({
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            refreshToken: "legacy-refresh-old",
+            email: "legacy@example.com",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+        ],
+      });
+
+      await fs.writeFile(
+        exportPath,
+        JSON.stringify({
+          version: 3,
+          activeIndex: 0,
+          accounts: [
+            {
+              refreshToken: "legacy-refresh-new",
+              email: "legacy@example.com",
+              addedAt: 2,
+              lastUsed: 20,
+            },
+          ],
+        }),
+      );
+
+      await importAccounts(exportPath);
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(1);
+      expect(loaded?.accounts[0]?.refreshToken).toBe("legacy-refresh-new");
     });
 
     it("should serialize concurrent transactional updates without losing accounts", async () => {
@@ -199,9 +633,6 @@ describe("storage", () => {
     });
 
     it("should enforce MAX_ACCOUNTS during import", async () => {
-       // @ts-ignore
-      const { importAccounts } = await import("../lib/storage.js");
-      
       const manyAccounts = Array.from({ length: 21 }, (_, i) => ({
         accountId: `acct${i}`,
         refreshToken: `ref${i}`,
@@ -215,33 +646,124 @@ describe("storage", () => {
         accounts: manyAccounts
       };
       await fs.writeFile(exportPath, JSON.stringify(toImport));
-      
-      // @ts-ignore
+
       await expect(importAccounts(exportPath)).rejects.toThrow(/exceed maximum/);
     });
 
     it("should fail export when no accounts exist", async () => {
-      const { exportAccounts } = await import("../lib/storage.js");
       setStoragePathDirect(testStoragePath);
       await expect(exportAccounts(exportPath)).rejects.toThrow(/No accounts to export/);
     });
 
     it("should fail import when file does not exist", async () => {
-      const { importAccounts } = await import("../lib/storage.js");
       const nonexistentPath = join(testWorkDir, "nonexistent-file.json");
       await expect(importAccounts(nonexistentPath)).rejects.toThrow(/Import file not found/);
     });
 
     it("should fail import when file contains invalid JSON", async () => {
-      const { importAccounts } = await import("../lib/storage.js");
       await fs.writeFile(exportPath, "not valid json {[");
       await expect(importAccounts(exportPath)).rejects.toThrow(/Invalid JSON/);
     });
 
     it("should fail import when file contains invalid format", async () => {
-      const { importAccounts } = await import("../lib/storage.js");
       await fs.writeFile(exportPath, JSON.stringify({ invalid: "format" }));
       await expect(importAccounts(exportPath)).rejects.toThrow(/Invalid account storage format/);
+    });
+
+    it("continues import in best-effort mode when pre-import backup write is locked", async () => {
+      await saveAccounts({
+        version: 3,
+        activeIndex: 0,
+        accounts: [{ accountId: "existing", refreshToken: "ref-existing", addedAt: 1, lastUsed: 1 }],
+      });
+
+      await fs.writeFile(
+        exportPath,
+        JSON.stringify({
+          version: 3,
+          activeIndex: 0,
+          accounts: [{ accountId: "imported", refreshToken: "ref-imported", addedAt: 2, lastUsed: 2 }],
+        }),
+      );
+
+      const originalWriteFile = fs.writeFile.bind(fs);
+      const writeSpy = vi.spyOn(fs, "writeFile").mockImplementation(async (path, data, options) => {
+        const filePath = String(path);
+        if (filePath.includes("codex-pre-import-backup") && filePath.endsWith(".tmp")) {
+          const err = new Error("backup locked by antivirus") as NodeJS.ErrnoException;
+          err.code = "EBUSY";
+          throw err;
+        }
+        return originalWriteFile(
+          path as Parameters<typeof fs.writeFile>[0],
+          data as Parameters<typeof fs.writeFile>[1],
+          options as Parameters<typeof fs.writeFile>[2],
+        );
+      });
+
+      let result: Awaited<ReturnType<typeof importAccounts>>;
+      try {
+        result = await importAccounts(exportPath, {
+          preImportBackupPrefix: "codex-pre-import-backup",
+          backupMode: "best-effort",
+        });
+      } finally {
+        writeSpy.mockRestore();
+      }
+
+      expect(result.backupStatus).toBe("failed");
+      expect(result.backupError).toContain("backup locked by antivirus");
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(2);
+      expect(loaded?.accounts.map((account) => account.accountId)).toContain("imported");
+    });
+
+    it("fails required import when pre-import backup write times out", async () => {
+      await saveAccounts({
+        version: 3,
+        activeIndex: 0,
+        accounts: [{ accountId: "existing", refreshToken: "ref-existing", addedAt: 1, lastUsed: 1 }],
+      });
+
+      await fs.writeFile(
+        exportPath,
+        JSON.stringify({
+          version: 3,
+          activeIndex: 0,
+          accounts: [{ accountId: "imported", refreshToken: "ref-imported", addedAt: 2, lastUsed: 2 }],
+        }),
+      );
+
+      const originalWriteFile = fs.writeFile.bind(fs);
+      const writeSpy = vi.spyOn(fs, "writeFile").mockImplementation(async (path, data, options) => {
+        const filePath = String(path);
+        if (filePath.includes("codex-pre-import-backup") && filePath.endsWith(".tmp")) {
+          const abortError = new Error("aborted");
+          abortError.name = "AbortError";
+          throw abortError;
+        }
+        return originalWriteFile(
+          path as Parameters<typeof fs.writeFile>[0],
+          data as Parameters<typeof fs.writeFile>[1],
+          options as Parameters<typeof fs.writeFile>[2],
+        );
+      });
+
+      try {
+        await expect(
+          importAccounts(exportPath, {
+            preImportBackupPrefix: "codex-pre-import-backup",
+            backupMode: "required",
+          }),
+        ).rejects.toThrow("Pre-import backup failed");
+      } finally {
+        writeSpy.mockRestore();
+      }
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(1);
+      expect(loaded?.accounts[0]?.accountId).toBe("existing");
     });
   });
 
@@ -597,6 +1119,219 @@ describe("storage", () => {
       const result = normalizeAccountStorage(data);
       expect(result?.accounts).toHaveLength(1);
     });
+
+    it("preserves accounts with different accountId values even when refreshToken and email are shared (no organizationId)", () => {
+      const data = {
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            accountId: "workspace-a",
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            addedAt: 1,
+            lastUsed: 1,
+          },
+          {
+            accountId: "workspace-b",
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            addedAt: 2,
+            lastUsed: 2,
+          },
+        ],
+      };
+
+      const result = normalizeAccountStorage(data);
+      expect(result?.accounts).toHaveLength(2);
+      const accountIds = result?.accounts.map((account) => account.accountId);
+      expect(accountIds).toContain("workspace-a");
+      expect(accountIds).toContain("workspace-b");
+    });
+
+    it("preserves organization-scoped variants that share the same refresh token", () => {
+      const data = {
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            organizationId: "org-1",
+            accountId: "workspace-a",
+            refreshToken: "refresh-old",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+          {
+            organizationId: "org-1",
+            accountId: "workspace-b",
+            refreshToken: "refresh-new",
+            addedAt: 2,
+            lastUsed: 20,
+          },
+          {
+            organizationId: "org-2",
+            accountId: "workspace-b",
+            refreshToken: "refresh-new",
+            addedAt: 3,
+            lastUsed: 30,
+          },
+        ],
+      };
+
+      const result = normalizeAccountStorage(data);
+      expect(result?.accounts).toHaveLength(2);
+      const organizationIds = result?.accounts
+        .map((account) => account.organizationId)
+        .filter((organizationId): organizationId is string => typeof organizationId === "string");
+      expect(new Set(organizationIds)).toEqual(new Set(["org-1", "org-2"]));
+      expect(result?.accounts.every((account) => account.accountId === "workspace-b")).toBe(true);
+    });
+
+    it("preserves workspace variants when organizationId differs despite same accountId and refreshToken", () => {
+      const data = {
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            organizationId: "org-1",
+            accountId: "same-workspace",
+            refreshToken: "shared-refresh",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+          {
+            organizationId: "org-2",
+            accountId: "same-workspace",
+            refreshToken: "shared-refresh",
+            addedAt: 2,
+            lastUsed: 20,
+          },
+        ],
+      };
+
+      const result = normalizeAccountStorage(data);
+      expect(result?.accounts).toHaveLength(2);
+      expect(result?.accounts.every((account) => account.accountId === "same-workspace")).toBe(true);
+      expect(result?.accounts.every((account) => account.refreshToken === "shared-refresh")).toBe(true);
+      expect(result?.accounts.map((account) => account.organizationId).sort()).toEqual(["org-1", "org-2"]);
+    });
+
+    it("does not bind org-scoped entry with empty accountId to fallback accountId based on order", () => {
+      const firstOrder = normalizeAccountStorage({
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          { organizationId: "org-1", refreshToken: "shared-refresh", addedAt: 1, lastUsed: 1 },
+          { accountId: "workspace-a", refreshToken: "shared-refresh", addedAt: 2, lastUsed: 2 },
+          { accountId: "workspace-b", refreshToken: "shared-refresh", addedAt: 3, lastUsed: 3 },
+        ],
+      });
+      const secondOrder = normalizeAccountStorage({
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          { organizationId: "org-1", refreshToken: "shared-refresh", addedAt: 1, lastUsed: 1 },
+          { accountId: "workspace-b", refreshToken: "shared-refresh", addedAt: 2, lastUsed: 2 },
+          { accountId: "workspace-a", refreshToken: "shared-refresh", addedAt: 3, lastUsed: 3 },
+        ],
+      });
+
+      for (const normalized of [firstOrder, secondOrder]) {
+        expect(normalized?.accounts).toHaveLength(3);
+        const orgScoped = normalized?.accounts.find((account) => account.organizationId === "org-1");
+        expect(orgScoped).toBeDefined();
+        expect(orgScoped?.accountId).toBeUndefined();
+        const noOrgAccountIds = normalized?.accounts
+          .filter((account) => !account.organizationId)
+          .map((account) => account.accountId)
+          .sort();
+        expect(noOrgAccountIds).toEqual(["workspace-a", "workspace-b"]);
+      }
+    });
+
+    it("retains legacy no-organization dedupe semantics", () => {
+      const data = {
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            accountId: "legacy-account",
+            refreshToken: "legacy-old",
+            email: "legacy-account@example.com",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+          {
+            accountId: "legacy-account",
+            refreshToken: "legacy-new",
+            email: "legacy-account@example.com",
+            addedAt: 2,
+            lastUsed: 20,
+          },
+          {
+            refreshToken: "legacy-refresh",
+            email: "refresh-a@example.com",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+          {
+            refreshToken: "legacy-refresh",
+            email: "refresh-b@example.com",
+            addedAt: 2,
+            lastUsed: 20,
+          },
+          {
+            refreshToken: "legacy-email-old",
+            email: "legacy-email@example.com",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+          {
+            refreshToken: "legacy-email-new",
+            email: "legacy-email@example.com",
+            addedAt: 2,
+            lastUsed: 20,
+          },
+        ],
+      };
+
+      const result = normalizeAccountStorage(data);
+      expect(result?.accounts).toHaveLength(3);
+      expect(result?.accounts.find((account) => account.accountId === "legacy-account")?.refreshToken).toBe(
+        "legacy-new",
+      );
+      expect(result?.accounts.find((account) => account.refreshToken === "legacy-refresh")?.email).toBe(
+        "refresh-b@example.com",
+      );
+      expect(result?.accounts.find((account) => account.email === "legacy-email@example.com")?.refreshToken).toBe(
+        "legacy-email-new",
+      );
+    });
+
+    it("deduplicates legacy no-accountId records by email", () => {
+      const data = {
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            refreshToken: "legacy-old",
+            email: "legacy@example.com",
+            addedAt: 1,
+            lastUsed: 10,
+          },
+          {
+            refreshToken: "legacy-new",
+            email: "legacy@example.com",
+            addedAt: 2,
+            lastUsed: 20,
+          },
+        ],
+      };
+
+      const result = normalizeAccountStorage(data);
+      expect(result?.accounts).toHaveLength(1);
+      expect(result?.accounts[0]?.refreshToken).toBe("legacy-new");
+    });
   });
 
   describe("loadAccounts", () => {
@@ -728,6 +1463,151 @@ describe("storage", () => {
 
     it("does not throw when file does not exist", async () => {
       await expect(clearAccounts()).resolves.not.toThrow();
+    });
+  });
+
+  describe("flagged account storage", () => {
+    const testWorkDir = join(tmpdir(), "codex-flagged-test-" + Math.random().toString(36).slice(2));
+    let testStoragePath: string;
+
+    beforeEach(async () => {
+      await fs.mkdir(testWorkDir, { recursive: true });
+      testStoragePath = join(testWorkDir, "accounts.json");
+      setStoragePathDirect(testStoragePath);
+    });
+
+    afterEach(async () => {
+      setStoragePathDirect(null);
+      await fs.rm(testWorkDir, { recursive: true, force: true });
+    });
+
+    it("preserves organizationId through flagged save/load normalization", async () => {
+      await saveFlaggedAccounts({
+        version: 1,
+        accounts: [
+          {
+            refreshToken: "flagged-refresh",
+            organizationId: "org-secondary",
+            accountId: "id-secondary",
+            accountIdSource: "id_token",
+            flaggedAt: 123,
+            addedAt: 123,
+            lastUsed: 123,
+          },
+        ],
+      });
+
+      const loaded = await loadFlaggedAccounts();
+      expect(loaded.accounts).toHaveLength(1);
+      expect(loaded.accounts[0]?.organizationId).toBe("org-secondary");
+      expect(loaded.accounts[0]?.accountIdSource).toBe("id_token");
+    });
+
+    it("preserves sibling flagged workspaces when organizationId is shared but accountId differs", async () => {
+      await saveFlaggedAccounts({
+        version: 1,
+        accounts: [
+          {
+            refreshToken: "shared-refresh",
+            organizationId: "org-shared",
+            accountId: "workspace-a",
+            flaggedAt: 100,
+            addedAt: 100,
+            lastUsed: 100,
+          },
+          {
+            refreshToken: "shared-refresh",
+            organizationId: "org-shared",
+            accountId: "workspace-b",
+            flaggedAt: 200,
+            addedAt: 200,
+            lastUsed: 200,
+          },
+        ],
+      });
+
+      const loaded = await loadFlaggedAccounts();
+      expect(loaded.accounts).toHaveLength(2);
+      expect(new Set(loaded.accounts.map((account) => account.accountId))).toEqual(
+        new Set(["workspace-a", "workspace-b"]),
+      );
+    });
+
+    it("serializes flagged account read-modify-write updates", async () => {
+      const writeWorkspace = async (
+        refreshToken: string,
+        accountId: string,
+        delayMs: number,
+      ) =>
+        withFlaggedAccountStorageTransaction(async (current, persist) => {
+          const nextStorage = {
+            ...current,
+            accounts: current.accounts.map((account) => ({ ...account })),
+          };
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          nextStorage.accounts.push({
+            refreshToken,
+            organizationId: "org-shared",
+            accountId,
+            flaggedAt: Date.now(),
+            addedAt: Date.now(),
+            lastUsed: Date.now(),
+          });
+          await persist(nextStorage);
+        });
+
+      await Promise.all([
+        writeWorkspace("shared-refresh", "workspace-a", 25),
+        writeWorkspace("shared-refresh", "workspace-b", 0),
+      ]);
+
+      const loaded = await loadFlaggedAccounts();
+      expect(loaded.accounts).toHaveLength(2);
+      expect(new Set(loaded.accounts.map((account) => account.accountId))).toEqual(
+        new Set(["workspace-a", "workspace-b"]),
+      );
+    });
+
+    it("retries flagged storage rename on EBUSY and succeeds", async () => {
+      const originalRename = fs.rename.bind(fs);
+      let attemptCount = 0;
+      const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (oldPath, newPath) => {
+        const destination = String(newPath);
+        if (destination.includes("openai-codex-flagged-accounts.json")) {
+          attemptCount += 1;
+          if (attemptCount <= 2) {
+            const err = new Error("EBUSY error") as NodeJS.ErrnoException;
+            err.code = "EBUSY";
+            throw err;
+          }
+        }
+        return originalRename(
+          oldPath as Parameters<typeof fs.rename>[0],
+          newPath as Parameters<typeof fs.rename>[1],
+        );
+      });
+
+      try {
+        await saveFlaggedAccounts({
+          version: 1,
+          accounts: [
+            {
+              refreshToken: "flagged-ebusy",
+              accountId: "flagged-ebusy-account",
+              flaggedAt: Date.now(),
+              addedAt: Date.now(),
+              lastUsed: Date.now(),
+            },
+          ],
+        });
+      } finally {
+        renameSpy.mockRestore();
+      }
+
+      expect(attemptCount).toBe(3);
+      const loaded = await loadFlaggedAccounts();
+      expect(loaded.accounts).toHaveLength(1);
+      expect(loaded.accounts[0]?.refreshToken).toBe("flagged-ebusy");
     });
   });
 
@@ -998,6 +1878,226 @@ describe("storage", () => {
       expect(existsSync(legacyStoragePath)).toBe(false);
       expect(existsSync(getStoragePath())).toBe(true);
     });
+
+    it("loads global storage as fallback when project-scoped storage is missing", async () => {
+      const fakeHome = join(testWorkDir, "home-fallback");
+      const projectDir = join(testWorkDir, "project-fallback");
+      const projectGitDir = join(projectDir, ".git");
+      const globalConfigDir = join(fakeHome, ".opencode");
+      const globalStoragePath = join(globalConfigDir, "openai-codex-accounts.json");
+
+      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(projectGitDir, { recursive: true });
+      await fs.mkdir(globalConfigDir, { recursive: true });
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      setStoragePath(projectDir);
+
+      const globalStorage = {
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            refreshToken: "global-refresh",
+            accountId: "global-account",
+            addedAt: 1,
+            lastUsed: 1,
+          },
+        ],
+      };
+      await fs.writeFile(globalStoragePath, JSON.stringify(globalStorage), "utf-8");
+
+      const loaded = await loadAccounts();
+
+      expect(loaded).not.toBeNull();
+      expect(loaded?.accounts).toHaveLength(1);
+      expect(loaded?.accounts[0]?.accountId).toBe("global-account");
+
+      const projectScopedPath = getStoragePath();
+      expect(projectScopedPath).toContain(join(fakeHome, ".opencode", "projects"));
+      expect(existsSync(projectScopedPath)).toBe(true);
+
+      const seeded = JSON.parse(await fs.readFile(projectScopedPath, "utf-8")) as {
+        accounts?: Array<{ accountId?: string }>;
+      };
+      expect(seeded.accounts?.[0]?.accountId).toBe("global-account");
+    });
+
+    it("seeds project storage only once across serialized global-fallback loads", async () => {
+      const fakeHome = join(testWorkDir, "home-fallback-concurrent");
+      const projectDir = join(testWorkDir, "project-fallback-concurrent");
+      const projectGitDir = join(projectDir, ".git");
+      const globalConfigDir = join(fakeHome, ".opencode");
+      const globalStoragePath = join(globalConfigDir, "openai-codex-accounts.json");
+
+      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(projectGitDir, { recursive: true });
+      await fs.mkdir(globalConfigDir, { recursive: true });
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      setStoragePath(projectDir);
+
+      const globalStorage = {
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            refreshToken: "global-refresh-concurrent",
+            accountId: "global-account-concurrent",
+            addedAt: 1,
+            lastUsed: 1,
+          },
+        ],
+      };
+      await fs.writeFile(globalStoragePath, JSON.stringify(globalStorage), "utf-8");
+
+      const projectScopedPath = getStoragePath();
+      const originalRename = fs.rename.bind(fs);
+      let projectSeedWriteCount = 0;
+      const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (sourcePath, destinationPath) => {
+        if (String(destinationPath) === projectScopedPath) {
+          projectSeedWriteCount += 1;
+        }
+        return originalRename(sourcePath, destinationPath);
+      });
+
+      try {
+        const [first, second] = await Promise.all([loadAccounts(), loadAccounts()]);
+        expect(first?.accounts[0]?.accountId).toBe("global-account-concurrent");
+        expect(second?.accounts[0]?.accountId).toBe("global-account-concurrent");
+        expect(projectSeedWriteCount).toBe(1);
+      } finally {
+        renameSpy.mockRestore();
+      }
+    });
+
+    it("returns global fallback when project seed write fails", async () => {
+      const fakeHome = join(testWorkDir, "home-fallback-seed-fail");
+      const projectDir = join(testWorkDir, "project-fallback-seed-fail");
+      const projectGitDir = join(projectDir, ".git");
+      const globalConfigDir = join(fakeHome, ".opencode");
+      const globalStoragePath = join(globalConfigDir, "openai-codex-accounts.json");
+
+      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(projectGitDir, { recursive: true });
+      await fs.mkdir(globalConfigDir, { recursive: true });
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      setStoragePath(projectDir);
+
+      const globalStorage = {
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            refreshToken: "global-refresh-fail",
+            accountId: "global-account-fail",
+            addedAt: 1,
+            lastUsed: 1,
+          },
+        ],
+      };
+      await fs.writeFile(globalStoragePath, JSON.stringify(globalStorage), "utf-8");
+
+      const projectScopedPath = getStoragePath();
+      const originalRename = fs.rename.bind(fs);
+      const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (sourcePath, destinationPath) => {
+        if (String(destinationPath) === projectScopedPath) {
+          const err = new Error("EPERM seed failure") as NodeJS.ErrnoException;
+          err.code = "EPERM";
+          throw err;
+        }
+        return originalRename(sourcePath, destinationPath);
+      });
+
+      try {
+        const loaded = await loadAccounts();
+        expect(loaded?.accounts[0]?.accountId).toBe("global-account-fail");
+        expect(existsSync(projectScopedPath)).toBe(false);
+      } finally {
+        renameSpy.mockRestore();
+      }
+    });
+
+    it("skips seed write when project path access fails with non-ENOENT error", async () => {
+      const fakeHome = join(testWorkDir, "home-fallback-access-error");
+      const projectDir = join(testWorkDir, "project-fallback-access-error");
+      const projectGitDir = join(projectDir, ".git");
+      const globalConfigDir = join(fakeHome, ".opencode");
+      const globalStoragePath = join(globalConfigDir, "openai-codex-accounts.json");
+
+      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(projectGitDir, { recursive: true });
+      await fs.mkdir(globalConfigDir, { recursive: true });
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      setStoragePath(projectDir);
+
+      const globalStorage = {
+        version: 3,
+        activeIndex: 0,
+        accounts: [
+          {
+            refreshToken: "global-refresh-access-error",
+            accountId: "global-account-access-error",
+            addedAt: 1,
+            lastUsed: 1,
+          },
+        ],
+      };
+      await fs.writeFile(globalStoragePath, JSON.stringify(globalStorage), "utf-8");
+
+      const projectScopedPath = getStoragePath();
+      const originalAccess = fs.access.bind(fs);
+      const originalRename = fs.rename.bind(fs);
+      let projectSeedWriteCount = 0;
+
+      const accessSpy = vi.spyOn(fs, "access").mockImplementation(async (path, mode) => {
+        if (String(path) === projectScopedPath) {
+          const err = new Error("EACCES access failure") as NodeJS.ErrnoException;
+          err.code = "EACCES";
+          throw err;
+        }
+        return originalAccess(path as string, mode);
+      });
+
+      const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (sourcePath, destinationPath) => {
+        if (String(destinationPath) === projectScopedPath) {
+          projectSeedWriteCount += 1;
+        }
+        return originalRename(sourcePath, destinationPath);
+      });
+
+      try {
+        const loaded = await loadAccounts();
+        expect(loaded?.accounts[0]?.accountId).toBe("global-account-access-error");
+        expect(projectSeedWriteCount).toBe(0);
+        expect(existsSync(projectScopedPath)).toBe(false);
+      } finally {
+        accessSpy.mockRestore();
+        renameSpy.mockRestore();
+      }
+    });
+
+    it("returns null when global fallback storage is corrupted", async () => {
+      const fakeHome = join(testWorkDir, "home-fallback-corrupted");
+      const projectDir = join(testWorkDir, "project-fallback-corrupted");
+      const projectGitDir = join(projectDir, ".git");
+      const globalConfigDir = join(fakeHome, ".opencode");
+      const globalStoragePath = join(globalConfigDir, "openai-codex-accounts.json");
+
+      await fs.mkdir(fakeHome, { recursive: true });
+      await fs.mkdir(projectGitDir, { recursive: true });
+      await fs.mkdir(globalConfigDir, { recursive: true });
+      process.env.HOME = fakeHome;
+      process.env.USERPROFILE = fakeHome;
+      setStoragePath(projectDir);
+
+      await fs.writeFile(globalStoragePath, "{ invalid json", "utf-8");
+
+      await expect(loadAccounts()).resolves.toBeNull();
+      expect(existsSync(getStoragePath())).toBe(false);
+    });
   });
 
   describe("saveAccounts EPERM/EBUSY retry logic", () => {
@@ -1015,6 +2115,43 @@ describe("storage", () => {
       vi.useRealTimers();
       setStoragePathDirect(null);
       await fs.rm(testWorkDir, { recursive: true, force: true });
+    });
+
+    it("preserves org/token workspace variants sharing a refresh token when accountId differs", async () => {
+      const now = Date.now();
+      const storage = {
+        version: 3 as const,
+        activeIndex: 0,
+        accounts: [
+          {
+            accountId: "org-i1iYFgVqyAkR8CLrUKvNczIa",
+            organizationId: "org-i1iYFgVqyAkR8CLrUKvNczIa",
+            accountIdSource: "org" as const,
+            email: "user@example.com",
+            refreshToken: "shared-refresh-kira",
+            addedAt: now,
+            lastUsed: now,
+          },
+          {
+            accountId: "7ff374aa-1b2e-4e69-89f3-0cec62582efb",
+            accountIdSource: "token" as const,
+            email: "user@example.com",
+            refreshToken: "shared-refresh-kira",
+            addedAt: now,
+            lastUsed: now,
+          },
+        ],
+      };
+
+      await saveAccounts(storage);
+
+      const loaded = await loadAccounts();
+      expect(loaded?.accounts).toHaveLength(2);
+      expect(loaded?.accounts.every((account) => account.refreshToken === "shared-refresh-kira")).toBe(true);
+      expect(loaded?.accounts.map((account) => account.accountId).sort()).toEqual([
+        "7ff374aa-1b2e-4e69-89f3-0cec62582efb",
+        "org-i1iYFgVqyAkR8CLrUKvNczIa",
+      ]);
     });
 
     it("retries on EPERM and succeeds on second attempt", async () => {

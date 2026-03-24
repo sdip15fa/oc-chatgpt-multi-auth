@@ -6,8 +6,8 @@ This directory contains the official OpenCode config templates for the ChatGPT C
 
 | File | OpenCode version | Description |
 |------|------------------|-------------|
-| [`opencode-modern.json`](./opencode-modern.json) | **v1.0.210+** | Variant-based config: 6 base models with 21 total presets |
-| [`opencode-legacy.json`](./opencode-legacy.json) | **v1.0.209 and below** | Legacy explicit entries: 21 individual model definitions |
+| [`opencode-modern.json`](./opencode-modern.json) | **v1.0.210+** | Variant-based config: 9 base models with 34 total presets |
+| [`opencode-legacy.json`](./opencode-legacy.json) | **v1.0.209 and below** | Legacy explicit entries: 34 individual model definitions |
 
 ## Quick pick
 
@@ -34,10 +34,16 @@ opencode --version
 OpenCode v1.0.210+ added model `variants`, so one model entry can expose multiple reasoning levels. That keeps modern config much smaller while preserving the same effective presets.
 
 Both templates include:
-- GPT-5.2, GPT-5 Codex, GPT-5.1, GPT-5.1 Codex, GPT-5.1 Codex Max, GPT-5.1 Codex Mini
+- GPT-5.4, GPT-5.4 Pro, GPT-5.4 Mini, GPT-5.4 Nano, GPT-5 Codex, GPT-5.1, GPT-5.1 Codex, GPT-5.1 Codex Max, GPT-5.1 Codex Mini
 - Reasoning variants per model family
 - `store: false` and `include: ["reasoning.encrypted_content"]`
-- Context metadata (272k context / 128k output)
+- Context metadata (`gpt-5.4`/`gpt-5.4-pro`: 1,050,000; `gpt-5.4-mini`/`gpt-5.4-nano`/Codex models: 400,000; `gpt-5.1`: 272,000; all output: 128,000)
+
+Use `opencode debug config` to verify that these template entries were merged into your effective config. `opencode models openai` currently shows OpenCode's built-in provider catalog and can omit config-defined entries such as `gpt-5.4-mini`.
+
+If your OpenCode runtime supports global compaction tuning, you can also set:
+- `model_context_window = 1050000`
+- `model_auto_compact_token_limit = 950000`
 
 ## Spark model note
 
@@ -50,14 +56,14 @@ If your workspace is entitled, you can add Spark model IDs manually.
 Modern template (v1.0.210+):
 
 ```bash
-opencode run "task" --model=openai/gpt-5.2 --variant=medium
+opencode run "task" --model=openai/gpt-5.4 --variant=medium
 opencode run "task" --model=openai/gpt-5-codex --variant=high
 ```
 
 Legacy template (v1.0.209 and below):
 
 ```bash
-opencode run "task" --model=openai/gpt-5.2-medium
+opencode run "task" --model=openai/gpt-5.4-medium
 opencode run "task" --model=openai/gpt-5-codex-high
 ```
 
@@ -71,9 +77,11 @@ Current defaults are strict entitlement handling:
 - `unsupportedCodexPolicy: "strict"` returns entitlement errors directly
 - set `unsupportedCodexPolicy: "fallback"` (or `CODEX_AUTH_UNSUPPORTED_MODEL_POLICY=fallback`) to enable automatic fallback retries
 - `fallbackToGpt52OnUnsupportedGpt53: true` keeps the legacy `gpt-5.3-codex -> gpt-5.2-codex` edge inside fallback mode
+- `gpt-5.4-pro -> gpt-5.4` is included by default in fallback mode (relevant only if you add `gpt-5.4-pro` manually)
 - `unsupportedCodexFallbackChain` lets you override fallback order per model
 
 Default fallback chain (when policy is `fallback`):
+- `gpt-5.4-pro -> gpt-5.4` (if you manually select `gpt-5.4-pro`)
 - `gpt-5.3-codex -> gpt-5-codex -> gpt-5.2-codex`
 - `gpt-5.3-codex-spark -> gpt-5-codex -> gpt-5.3-codex -> gpt-5.2-codex` (only relevant if Spark IDs are added manually)
 - `gpt-5.2-codex -> gpt-5-codex`

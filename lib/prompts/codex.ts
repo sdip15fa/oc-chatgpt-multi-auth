@@ -48,6 +48,9 @@ export type ModelFamily =
 	| "gpt-5-codex"
 	| "codex-max"
 	| "codex"
+	| "gpt-5.4"
+	| "gpt-5.4-mini"
+	| "gpt-5.4-pro"
 	| "gpt-5.2"
 	| "gpt-5.1";
 
@@ -59,6 +62,9 @@ export const MODEL_FAMILIES: readonly ModelFamily[] = [
 	"gpt-5-codex",
 	"codex-max",
 	"codex",
+	"gpt-5.4",
+	"gpt-5.4-mini",
+	"gpt-5.4-pro",
 	"gpt-5.2",
 	"gpt-5.1",
 ] as const;
@@ -71,6 +77,12 @@ const PROMPT_FILES: Record<ModelFamily, string> = {
 	"gpt-5-codex": "gpt_5_codex_prompt.md",
 	"codex-max": "gpt-5.1-codex-max_prompt.md",
 	codex: "gpt_5_codex_prompt.md",
+	// As of Codex rust-v0.111.0, GPT-5.4 uses the same prompt file family as GPT-5.2.
+	"gpt-5.4": "gpt_5_2_prompt.md",
+	// GPT-5.4-mini uses the same core prompt file as GPT-5.4, but keeps isolated cache/family state.
+	"gpt-5.4-mini": "gpt_5_2_prompt.md",
+	// GPT-5.4-pro uses the same core prompt file as GPT-5.4, but keeps isolated cache/family state.
+	"gpt-5.4-pro": "gpt_5_2_prompt.md",
 	"gpt-5.2": "gpt_5_2_prompt.md",
 	"gpt-5.1": "gpt_5_1_prompt.md",
 };
@@ -82,6 +94,9 @@ const CACHE_FILES: Record<ModelFamily, string> = {
 	"gpt-5-codex": "gpt-5-codex-instructions.md",
 	"codex-max": "codex-max-instructions.md",
 	codex: "codex-instructions.md",
+	"gpt-5.4": "gpt-5.4-instructions.md",
+	"gpt-5.4-mini": "gpt-5.4-mini-instructions.md",
+	"gpt-5.4-pro": "gpt-5.4-pro-instructions.md",
 	"gpt-5.2": "gpt-5.2-instructions.md",
 	"gpt-5.1": "gpt-5.1-instructions.md",
 };
@@ -114,6 +129,15 @@ export function getModelFamily(normalizedModel: string): ModelFamily {
 		normalizedModel.startsWith("codex-")
 	) {
 		return "codex";
+	}
+	if (/\bgpt(?:-| )5\.4(?:-| )pro(?:\b|[- ])/i.test(normalizedModel)) {
+		return "gpt-5.4-pro";
+	}
+	if (/\bgpt(?:-| )5\.4(?:-| )mini(?:\b|[- ])/i.test(normalizedModel)) {
+		return "gpt-5.4-mini";
+	}
+	if (/\bgpt(?:-| )5\.4(?:\b|[- ])/i.test(normalizedModel)) {
+		return "gpt-5.4";
 	}
 	if (normalizedModel.includes("gpt-5.2")) {
 		return "gpt-5.2";
@@ -396,7 +420,7 @@ function refreshInstructionsInBackground(
  * Prewarm instruction caches for the provided models/families.
  */
 export function prewarmCodexInstructions(models: string[] = []): void {
-	const candidates = models.length > 0 ? models : ["gpt-5-codex", "gpt-5.2", "gpt-5.1"];
+	const candidates = models.length > 0 ? models : ["gpt-5-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-pro", "gpt-5.2", "gpt-5.1"];
 	for (const model of candidates) {
 		void getCodexInstructions(model).catch((error) => {
 			logDebug("Codex instruction prewarm failed", {
@@ -417,11 +441,11 @@ YOU ARE IN A DIFFERENT ENVIRONMENT. These instructions override ALL previous too
 
 <tool_replacements priority="0">
 <critical_rule priority="0">
-apply_patch/applyPatch are Codex names. In OpenCode, use native tools:
-- For diff-style or multi-line structural edits: use patch
-- For precise in-place string replacements: use edit
-- Never call a tool literally named apply_patch/applyPatch
-- If an instruction says apply_patch, translate that intent to patch first
+Patch-edit tool names differ by runtime (for example: apply_patch, patch, edit).
+- Always use the exact tool names listed in the active tool schema/manifest
+- If the schema exposes apply_patch, call apply_patch directly
+- If the schema exposes patch/edit instead, use patch/edit as listed
+- Never invent aliases or auto-translate tool names
 </critical_rule>
 
 <critical_rule priority="0">
@@ -434,10 +458,12 @@ apply_patch/applyPatch are Codex names. In OpenCode, use native tools:
 </tool_replacements>
 
 <available_tools priority="0">
+Note: This list is illustrative. Always defer to the active tool schema/manifest.
 File Operations:
   • write  - Create new files
   • edit   - Modify existing files with string replacement
   • patch  - Apply diff patches
+  • apply_patch - Apply diff patches (alternate runtime name; use whichever the schema exposes)
   • read   - Read file contents
 
 Search/Discovery:
@@ -463,15 +489,15 @@ Task Management:
 </tool_call_guardrails>
 
 <substitution_rules priority="0">
-Base instruction says:    You MUST use instead:
-apply_patch           →   patch (preferred), or edit for targeted replacements
+Base instruction says:    Correct behaviour:
+apply_patch/patch      →   use the exact tool name from the active schema (no renaming)
 update_plan           →   todowrite
 read_plan             →   todoread
 </substitution_rules>
 
 <verification_checklist priority="0">
 Before file/plan modifications:
-1. Am I using patch or edit, never a tool named apply_patch?
+1. Am I using the exact patch/edit (including apply_patch when exposed) tool name listed by the active schema?
 2. Am I using "todowrite" NOT "update_plan"?
 3. Is this tool in the approved list above?
 4. Am I following the active tool schema (including path format)?

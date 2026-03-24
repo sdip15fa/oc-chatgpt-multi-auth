@@ -290,6 +290,123 @@ describe("Token Utils Module", () => {
 			expect(candidates.some((c) => c.accountId === "claim_orgs_id")).toBe(true);
 		});
 
+		it("should extract all ids from id_token auth.organizations array", () => {
+			mockedDecodeJWT.mockImplementation((token) => {
+				if (token === "id_token") {
+					return {
+						[JWT_CLAIM_PATH]: {
+							organizations: [
+								{ id: "claim_org_1", name: "Claim Org One" },
+								{ id: "claim_org_2", name: "Claim Org Two" },
+							],
+						},
+					};
+				}
+				return null;
+			});
+			const candidates = getAccountIdCandidates(undefined, "id_token");
+			const organizationCandidates = candidates.filter((c) => c.source === "org");
+			expect(organizationCandidates.map((c) => c.accountId)).toEqual([
+				"claim_org_1",
+				"claim_org_2",
+			]);
+			expect(organizationCandidates.map((c) => c.organizationId)).toEqual([
+				"claim_org_1",
+				"claim_org_2",
+			]);
+		});
+
+		it("maps auth teams/workspaces/accounts to canonical organization IDs when index-aligned", () => {
+			mockedDecodeJWT.mockImplementation((token) => {
+				if (token !== "id_token") return null;
+				return {
+					[JWT_CLAIM_PATH]: {
+						organizations: [
+							{ id: "org-a", account_id: "org-a-account", name: "Org A" },
+							{ id: "org-b", account_id: "org-b-account", name: "Org B" },
+						],
+						teams: [
+							{ team_id: "team-a-account", team_name: "Team A" },
+							{ team_id: "team-b-account", team_name: "Team B" },
+						],
+					},
+				};
+			});
+
+			const candidates = getAccountIdCandidates(undefined, "id_token");
+			const orgCandidates = candidates.filter((candidate) => candidate.source === "org");
+
+			expect(orgCandidates).toHaveLength(2);
+			expect(orgCandidates.map((candidate) => candidate.organizationId)).toEqual([
+				"org-a",
+				"org-b",
+			]);
+			expect(orgCandidates.map((candidate) => candidate.accountId)).toEqual([
+				"org-a-account",
+				"org-b-account",
+			]);
+		});
+
+		it("preserves explicit team organization IDs even when canonical org arrays are index-aligned", () => {
+			mockedDecodeJWT.mockImplementation((token) => {
+				if (token !== "id_token") return null;
+				return {
+					[JWT_CLAIM_PATH]: {
+						organizations: [
+							{ id: "org-a", account_id: "org-a-account", name: "Org A" },
+							{ id: "org-b", account_id: "org-b-account", name: "Org B" },
+						],
+						teams: [
+							{
+								team_id: "team-a-account",
+								organization_id: "team-org-b",
+								team_name: "Team A",
+							},
+							{
+								team_id: "team-b-account",
+								organization_id: "team-org-a",
+								team_name: "Team B",
+							},
+						],
+					},
+				};
+			});
+
+			const candidates = getAccountIdCandidates(undefined, "id_token");
+			const teamCandidates = candidates.filter((candidate) =>
+				candidate.accountId.startsWith("team-"),
+			);
+
+			expect(teamCandidates.map((candidate) => candidate.organizationId)).toEqual([
+				"team-org-b",
+				"team-org-a",
+			]);
+		});
+
+		it("skips canonical mapping for non-organization arrays when lengths are misaligned", () => {
+			mockedDecodeJWT.mockImplementation((token) => {
+				if (token !== "id_token") return null;
+				return {
+					[JWT_CLAIM_PATH]: {
+						organizations: [{ id: "org-a", account_id: "org-a-account", name: "Org A" }],
+						teams: [
+							{ team_id: "team-a-account", organization_id: "team-org-a", team_name: "Team A" },
+							{ team_id: "team-b-account", organization_id: "team-org-b", team_name: "Team B" },
+						],
+					},
+				};
+			});
+
+			const candidates = getAccountIdCandidates(undefined, "id_token");
+			const orgCandidates = candidates.filter((candidate) => candidate.source === "org");
+
+			expect(orgCandidates.map((candidate) => candidate.organizationId)).toEqual([
+				"org-a",
+				"team-org-a",
+				"team-org-b",
+			]);
+		});
+
 		it("should extract default candidate from access token", () => {
 			mockedDecodeJWT.mockReturnValue({
 				[JWT_CLAIM_PATH]: {
@@ -341,6 +458,19 @@ describe("Token Utils Module", () => {
 			const candidates = getAccountIdCandidates("access_token");
 			const sameIdCandidates = candidates.filter((c) => c.accountId === "acc_same");
 			expect(sameIdCandidates.length).toBe(1);
+		});
+
+		it("should collapse duplicate org candidates by organizationId", () => {
+			mockedDecodeJWT.mockReturnValue({
+				organizations: [
+					{ account_id: "acc_one", organization_id: "org_dup", name: "Org A" },
+					{ account_id: "acc_two", organization_id: "org_dup", name: "Org B" },
+				],
+			});
+			const candidates = getAccountIdCandidates("access_token");
+			const duplicateOrgCandidates = candidates.filter((c) => c.organizationId === "org_dup");
+			expect(duplicateOrgCandidates).toHaveLength(1);
+			expect(duplicateOrgCandidates[0]?.accountId).toBe("acc_one");
 		});
 
 		it("should extract from id_token separately", () => {
@@ -564,9 +694,160 @@ describe("Token Utils Module", () => {
 			expect(candidate).toBeDefined();
 			expect(candidate?.label).toContain("[id:a]");
 		});
+
+		describe("canonical organizationId priority (hotfix 5.4)", () => {
+			it("prioritizes organizationId from canonical id_token path organizations[0].id", () => {
+				mockedDecodeJWT.mockImplementation((token) => {
+					if (token === "id_token") {
+						return {
+							[JWT_CLAIM_PATH]: {
+								chatgpt_account_id: "token_acc",
+								organizations: [{ id: "canonical-org-id", name: "Canonical Org" }],
+							},
+							// Other org-like fields in payload root
+							organizations: [{ id: "root-org-id", name: "Root Org" }],
+							organization_id: "fallback-org-id",
+						};
+					}
+					return null;
+				});
+				const candidates = getAccountIdCandidates(undefined, "id_token");
+				const idTokenCandidate = candidates.find((c) => c.source === "id_token");
+				expect(idTokenCandidate?.organizationId).toBe("canonical-org-id");
+			});
+
+			it("prefers canonical organizations[0].id over other org-like fields in id_token", () => {
+				mockedDecodeJWT.mockImplementation((token) => {
+					if (token === "id_token") {
+						return {
+							[JWT_CLAIM_PATH]: {
+								chatgpt_account_id: "token_acc",
+								organizations: [{ id: "canonical-org-123", name: "Canonical Org" }],
+								organization_id: "nested-fallback-org",
+							},
+							// Top-level org-like fields
+							organization_id: "top-level-fallback-org",
+							organizationId: "camelCaseFallbackOrg",
+						};
+					}
+					return null;
+				});
+				const candidates = getAccountIdCandidates(undefined, "id_token");
+				const idTokenCandidate = candidates.find((c) => c.source === "id_token");
+				expect(idTokenCandidate?.organizationId).toBe("canonical-org-123");
+			});
+
+			it("falls back to undefined when canonical organizations[0].id is missing", () => {
+				mockedDecodeJWT.mockImplementation((token) => {
+					if (token === "id_token") {
+						return {
+							[JWT_CLAIM_PATH]: {
+								chatgpt_account_id: "token_acc",
+								// organizations array exists but id field is missing
+								organizations: [{ name: "Org Without ID" }],
+							},
+							// Other org-like fields available
+							organization_id: "fallback-org-id",
+						};
+					}
+					return null;
+				});
+				const candidates = getAccountIdCandidates(undefined, "id_token");
+				const idTokenCandidate = candidates.find((c) => c.source === "id_token");
+				expect(idTokenCandidate?.organizationId).toBeUndefined();
+			});
+
+			it("falls back to undefined when canonical organizations array is missing", () => {
+				mockedDecodeJWT.mockImplementation((token) => {
+					if (token === "id_token") {
+						return {
+							[JWT_CLAIM_PATH]: {
+								chatgpt_account_id: "token_acc",
+								// No organizations array at all
+							},
+							organization_id: "fallback-org-id",
+						};
+					}
+					return null;
+				});
+				const candidates = getAccountIdCandidates(undefined, "id_token");
+				const idTokenCandidate = candidates.find((c) => c.source === "id_token");
+				expect(idTokenCandidate?.organizationId).toBeUndefined();
+			});
+
+			it("falls back to undefined when organizations array is empty", () => {
+				mockedDecodeJWT.mockImplementation((token) => {
+					if (token === "id_token") {
+						return {
+							[JWT_CLAIM_PATH]: {
+								chatgpt_account_id: "token_acc",
+								organizations: [],
+							},
+							organization_id: "fallback-org-id",
+						};
+					}
+					return null;
+				});
+				const candidates = getAccountIdCandidates(undefined, "id_token");
+				const idTokenCandidate = candidates.find((c) => c.source === "id_token");
+				expect(idTokenCandidate?.organizationId).toBeUndefined();
+			});
+
+			it("rejects organizations[0].organization_id when organizations[0].id is missing (strict orgId source)", () => {
+				mockedDecodeJWT.mockImplementation((token) => {
+					if (token === "id_token") {
+						return {
+							[JWT_CLAIM_PATH]: {
+								chatgpt_account_id: "token_acc",
+								organizations: [
+									{ organization_id: "nested-org-id", name: "Org Without ID" },
+								],
+							},
+						};
+					}
+					return null;
+				});
+				const candidates = getAccountIdCandidates(undefined, "id_token");
+				const idTokenCandidate = candidates.find((c) => c.source === "id_token");
+				expect(idTokenCandidate?.organizationId).toBeUndefined();
+			});
+		});
 	});
 
 	describe("selectBestAccountCandidate", () => {
+		it("selects best primary candidate without mutating candidate pool metadata", () => {
+			const candidates = [
+				{
+					accountId: "token-primary",
+					label: "Token Candidate [id:imary]",
+					source: "token" as const,
+				},
+				{
+					accountId: "org-default",
+					label: "Org Default [id:fault]",
+					source: "org" as const,
+					isDefault: true,
+					isPersonal: false,
+				},
+				{
+					accountId: "id-variant",
+					label: "ID Variant [id:riant]",
+					source: "id_token" as const,
+				},
+			];
+
+			const selected = selectBestAccountCandidate(candidates);
+
+			expect(selected?.accountId).toBe("org-default");
+			expect(selected?.source).toBe("org");
+			expect(selected?.label).toBe("Org Default [id:fault]");
+			expect(candidates.map((candidate) => candidate.accountId)).toEqual([
+				"token-primary",
+				"org-default",
+				"id-variant",
+			]);
+		});
+
 		it("prefers non-personal org default over token", () => {
 			const selected = selectBestAccountCandidate([
 				{

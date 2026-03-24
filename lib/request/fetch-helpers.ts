@@ -11,6 +11,7 @@ import { transformRequestBody, normalizeModel } from "./request-transformer.js";
 import { convertSseToJson, ensureContentType } from "./response-handler.js";
 import type { UserConfig, RequestBody } from "../types.js";
 import { CodexAuthError } from "../errors.js";
+import { DEACTIVATED_WORKSPACE_ERROR_CODE } from "../runtime-contracts.js";
 import { isRecord } from "../utils.js";
 import {
         CODEX_BASE_URL,
@@ -45,6 +46,7 @@ const NORMALIZED_UNSUPPORTED_MODEL_PATTERN =
 	/the model ['"]([^'"]+)['"] is not currently available for this chatgpt account/i;
 
 export const DEFAULT_UNSUPPORTED_CODEX_FALLBACK_CHAIN: Record<string, string[]> = {
+	"gpt-5.4-pro": ["gpt-5.4"],
 	"gpt-5.3-codex-spark": ["gpt-5-codex", "gpt-5.3-codex", "gpt-5.2-codex"],
 	"gpt-5.3-codex": ["gpt-5-codex", "gpt-5.2-codex"],
 	"gpt-5.2-codex": ["gpt-5-codex"],
@@ -278,6 +280,33 @@ export interface ErrorDiagnostics {
 	httpStatus?: number;
 }
 
+function getStructuredErrorCode(errorBody: unknown): string | undefined {
+	if (!isRecord(errorBody)) return undefined;
+
+	const directCode = errorBody.code;
+	if (typeof directCode === "string" && directCode.trim()) return directCode.trim();
+
+	const detail = errorBody.detail;
+	if (isRecord(detail)) {
+		const detailCode = detail.code;
+		if (typeof detailCode === "string" && detailCode.trim()) return detailCode.trim();
+	}
+
+	const nestedError = errorBody.error;
+	if (isRecord(nestedError)) {
+		const nestedCode = nestedError.code ?? nestedError.type;
+		if (typeof nestedCode === "string" && nestedCode.trim()) return nestedCode.trim();
+	}
+
+	return undefined;
+}
+
+export function isDeactivatedWorkspaceError(errorBody: unknown, status?: number): boolean {
+	if (status !== undefined && status !== 402) return false;
+	const code = getStructuredErrorCode(errorBody);
+	return code === DEACTIVATED_WORKSPACE_ERROR_CODE;
+}
+
 /**
  * Determines if the current auth token needs to be refreshed
  * @param auth - Current authentication state
@@ -500,13 +529,14 @@ export async function transformRequestForCodex(
  * @param init - Request init options
  * @param accountId - ChatGPT account ID
  * @param accessToken - OAuth access token
+ * @param opts - Optional parameters including model, promptCacheKey, and organizationId
  * @returns Headers object with all required Codex headers
  */
 export function createCodexHeaders(
     init: RequestInit | undefined,
     accountId: string,
     accessToken: string,
-    opts?: { model?: string; promptCacheKey?: string },
+    opts?: { model?: string; promptCacheKey?: string; organizationId?: string },
 ): Headers {
 	const headers = new Headers(init?.headers ?? {});
 	headers.delete("x-api-key"); // Remove any existing API key
@@ -523,6 +553,12 @@ export function createCodexHeaders(
         headers.delete(OPENAI_HEADERS.CONVERSATION_ID);
         headers.delete(OPENAI_HEADERS.SESSION_ID);
     }
+
+    const organizationId = opts?.organizationId;
+    if (organizationId) {
+        headers.set(OPENAI_HEADERS.ORGANIZATION_ID, organizationId);
+    }
+
     headers.set("accept", "text/event-stream");
     return headers;
 }
@@ -722,6 +758,21 @@ function normalizeErrorPayload(
         status: number,
         diagnostics?: ErrorDiagnostics,
 ): ErrorPayload {
+	if (isDeactivatedWorkspaceError(errorBody, status)) {
+		const payload: ErrorPayload = {
+			error: {
+				message:
+					"The selected ChatGPT workspace is deactivated. This workspace entry should be removed from rotation or re-authorized before retrying.",
+				type: "workspace_deactivated",
+				code: DEACTIVATED_WORKSPACE_ERROR_CODE,
+			},
+		};
+		if (diagnostics && Object.keys(diagnostics).length > 0) {
+			payload.error.diagnostics = diagnostics;
+		}
+		return payload;
+	}
+
         if (isUnsupportedCodexModelForChatGpt(status, bodyText)) {
                 const unsupportedModel =
 			extractUnsupportedCodexModelFromText(bodyText) ?? "requested model";
@@ -730,7 +781,7 @@ function normalizeErrorPayload(
 								message:
 										`The model '${unsupportedModel}' is not currently available for this ChatGPT account when using Codex OAuth. ` +
 										"This is an account/workspace entitlement gate, not a temporary rate limit. " +
-										"Try 'gpt-5-codex' (canonical), or legacy aliases like 'gpt-5.3-codex'/'gpt-5.2-codex', or enable automatic fallback via " +
+										"Try 'gpt-5.4' (latest general), 'gpt-5-codex' (canonical), or legacy aliases like 'gpt-5.3-codex'/'gpt-5.2-codex', or enable automatic fallback via " +
 										'unsupportedCodexPolicy: "fallback" (or CODEX_AUTH_UNSUPPORTED_MODEL_POLICY=fallback). ' +
 										"(Legacy: CODEX_AUTH_FALLBACK_UNSUPPORTED_MODEL=1 or fallbackOnUnsupportedCodexModel).",
 								type: "entitlement_error",

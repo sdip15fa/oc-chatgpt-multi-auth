@@ -387,6 +387,90 @@ describe("AccountManager", () => {
     expect(third?.refreshToken).toBe("token-1");
   });
 
+  it("selects usable variant when refresh-token siblings are blocked", () => {
+    const now = Date.now();
+    const stored = {
+      version: 3 as const,
+      activeIndex: 0,
+      accounts: [
+        {
+          refreshToken: "shared-refresh",
+          accountId: "workspace-disabled",
+          addedAt: now,
+          lastUsed: now,
+          enabled: false,
+        },
+        {
+          refreshToken: "shared-refresh",
+          accountId: "workspace-rate-limited",
+          addedAt: now,
+          lastUsed: now,
+          rateLimitResetTimes: { codex: now + 60_000 },
+        },
+        {
+          refreshToken: "shared-refresh",
+          accountId: "workspace-cooling-down",
+          addedAt: now,
+          lastUsed: now,
+          coolingDownUntil: now + 60_000,
+          cooldownReason: "network-error" as const,
+        },
+        {
+          refreshToken: "shared-refresh",
+          accountId: "workspace-usable",
+          addedAt: now,
+          lastUsed: now,
+        },
+      ],
+    };
+
+    const manager = new AccountManager(undefined, stored);
+    const selected = manager.getCurrentOrNextForFamily("codex");
+
+    expect(selected?.accountId).toBe("workspace-usable");
+    expect(selected?.refreshToken).toBe("shared-refresh");
+  });
+
+  it("returns null and preserves min-wait behavior when all shared-token variants are blocked", () => {
+    const now = Date.now();
+    const stored = {
+      version: 3 as const,
+      activeIndex: 0,
+      accounts: [
+        {
+          refreshToken: "shared-refresh",
+          accountId: "workspace-disabled",
+          addedAt: now,
+          lastUsed: now,
+          enabled: false,
+        },
+        {
+          refreshToken: "shared-refresh",
+          accountId: "workspace-rate-limited",
+          addedAt: now,
+          lastUsed: now,
+          rateLimitResetTimes: { codex: now + 120_000 },
+        },
+        {
+          refreshToken: "shared-refresh",
+          accountId: "workspace-cooling-down",
+          addedAt: now,
+          lastUsed: now,
+          coolingDownUntil: now + 30_000,
+          cooldownReason: "auth-failure" as const,
+        },
+      ],
+    };
+
+    const manager = new AccountManager(undefined, stored);
+
+    expect(manager.getCurrentOrNextForFamily("codex")).toBeNull();
+
+    const minWait = manager.getMinWaitTimeForFamily("codex");
+    expect(minWait).toBeGreaterThan(0);
+    expect(minWait).toBeLessThanOrEqual(30_000);
+  });
+
   it("uses independent cursors per model family", () => {
     const now = Date.now();
     const stored = {
@@ -432,6 +516,8 @@ describe("AccountManager", () => {
   });
 
   describe("removeAccount", () => {
+    // Note: Tests in this block cover in-memory manager behavior.
+    // No-org duplicates collapse only when accountId is same/missing; distinct accountId entries are preserved.
     it("removes an account and updates indices", () => {
       const now = Date.now();
       const stored = {
@@ -504,6 +590,43 @@ describe("AccountManager", () => {
       expect(removed).toBe(true);
       expect(manager.getAccountCount()).toBe(0);
       expect(manager.getCurrentAccount()).toBe(null);
+    });
+
+    it("removes only targeted workspace when email/token are shared (manager-level, no orgId)", () => {
+      // Note: In-memory manager can hold multiple entries; canonical dedupe would collapse no-org duplicates only when accountId is same/missing
+      const now = Date.now();
+      const stored = {
+        version: 3 as const,
+        activeIndex: 0,
+        accounts: [
+          {
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            accountId: "workspace-a",
+            addedAt: now,
+            lastUsed: now,
+          },
+          {
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            accountId: "workspace-b",
+            addedAt: now,
+            lastUsed: now,
+          },
+        ],
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      expect(manager.getAccountCount()).toBe(2);
+
+      const second = manager.setActiveIndex(1);
+      expect(second?.accountId).toBe("workspace-b");
+
+      const removed = manager.removeAccount(second!);
+      expect(removed).toBe(true);
+      expect(manager.getAccountCount()).toBe(1);
+      expect(manager.getAccountsSnapshot()[0]?.accountId).toBe("workspace-a");
+      expect(manager.getActiveIndex()).toBe(0);
     });
   });
 
@@ -664,12 +787,109 @@ describe("AccountManager", () => {
 
       const manager = new AccountManager(undefined, stored);
       const account = manager.getCurrentAccount()!;
-      
-      manager.incrementAuthFailures(account);
-      manager.incrementAuthFailures(account);
+
+      // Increment failures twice
+      expect(manager.incrementAuthFailures(account)).toBe(1);
+      expect(manager.incrementAuthFailures(account)).toBe(2);
+
+      // Clear failures
       manager.clearAuthFailures(account);
-      
-      expect(account.consecutiveAuthFailures).toBe(0);
+
+      // After clearing, increment should start from 0 (returning 1)
+      expect(manager.incrementAuthFailures(account)).toBe(1);
+    });
+
+    it("tracks failures per refreshToken across multiple accounts", () => {
+      const now = Date.now();
+      const stored = {
+        version: 3 as const,
+        activeIndex: 0,
+        accounts: [
+          { refreshToken: "token-1", addedAt: now, lastUsed: now }, // base account
+          { refreshToken: "token-1", organizationId: "org-1", addedAt: now, lastUsed: now }, // org variant 1
+          { refreshToken: "token-1", organizationId: "org-2", addedAt: now, lastUsed: now }, // org variant 2
+          { refreshToken: "token-2", addedAt: now, lastUsed: now }, // different token
+        ],
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      const accounts = manager.getAccountsSnapshot();
+      expect(accounts).toHaveLength(4);
+      const account1 = accounts[0];
+      const account2 = accounts[1];
+      const account3 = accounts[2];
+      const account4 = accounts[3];
+
+      // Increment failures on first account (token-1)
+      expect(manager.incrementAuthFailures(account1)).toBe(1);
+      expect(manager.incrementAuthFailures(account2)).toBe(2);
+      expect(manager.incrementAuthFailures(account3)).toBe(3);
+
+      // Different token should start from 0
+      expect(manager.incrementAuthFailures(account4)).toBe(1);
+    });
+
+    it("removes all accounts with the same refreshToken", () => {
+      const now = Date.now();
+      const stored = {
+        version: 3 as const,
+        activeIndex: 0,
+        accounts: [
+          { refreshToken: "token-1", addedAt: now, lastUsed: now }, // base account
+          { refreshToken: "token-1", organizationId: "org-1", addedAt: now, lastUsed: now }, // org variant 1
+          { refreshToken: "token-1", organizationId: "org-2", addedAt: now, lastUsed: now }, // org variant 2
+          { refreshToken: "token-2", addedAt: now, lastUsed: now }, // different token
+        ],
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      expect(manager.getAccountCount()).toBe(4);
+
+      const accounts = manager.getAccountsSnapshot();
+      expect(accounts).toHaveLength(4);
+      const account1 = accounts[0];
+      const removedCount = manager.removeAccountsWithSameRefreshToken(account1);
+
+      // Should remove 3 accounts with token-1
+      expect(removedCount).toBe(3);
+      expect(manager.getAccountCount()).toBe(1);
+      expect(manager.getAccountsSnapshot()[0].refreshToken).toBe("token-2");
+    });
+
+    it("clears auth failure counter when removing accounts with same refreshToken", () => {
+      const now = Date.now();
+      const stored = {
+        version: 3 as const,
+        activeIndex: 0,
+        accounts: [
+          { refreshToken: "token-1", addedAt: now, lastUsed: now }, // base account
+          { refreshToken: "token-1", organizationId: "org-1", addedAt: now, lastUsed: now }, // org variant
+        ],
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      const accounts = manager.getAccountsSnapshot();
+      expect(accounts).toHaveLength(2);
+      const account1 = accounts[0];
+
+      // Increment auth failures for token-1
+      expect(manager.incrementAuthFailures(account1)).toBe(1);
+      expect(manager.incrementAuthFailures(account1)).toBe(2);
+      expect(manager.incrementAuthFailures(accounts[1])).toBe(3);
+
+      // Verify failures are tracked
+      expect(manager.incrementAuthFailures(account1)).toBe(4);
+
+      // Remove all accounts with token-1
+      const removedCount = manager.removeAccountsWithSameRefreshToken(account1);
+      expect(removedCount).toBe(2);
+      expect(manager.getAccountCount()).toBe(0);
+      const failuresByRefreshToken = Reflect.get(
+        manager,
+        "authFailuresByRefreshToken",
+      ) as Map<string, number>;
+      expect(failuresByRefreshToken.has("token-1")).toBe(false);
+      expect(manager.incrementAuthFailures(account1)).toBe(1);
     });
   });
 
@@ -844,6 +1064,37 @@ describe("AccountManager", () => {
       expect(account.accountId).toBe("org-selected-id");
       expect(account.accountIdSource).toBe("org");
     });
+
+    it("clears stale auth failure state when refresh token rotates", () => {
+      const now = Date.now();
+      const stored = {
+        version: 3 as const,
+        activeIndex: 0,
+        accounts: [
+          { refreshToken: "old-token", addedAt: now, lastUsed: now },
+        ],
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      const account = manager.getCurrentAccount()!;
+      expect(manager.incrementAuthFailures(account)).toBe(1);
+
+      const newAuth: OAuthAuthDetails = {
+        type: "oauth",
+        access: "new-access",
+        refresh: "new-refresh",
+        expires: now + 3600000,
+      };
+
+      manager.updateFromAuth(account, newAuth);
+
+      const failuresByRefreshToken = Reflect.get(
+        manager,
+        "authFailuresByRefreshToken",
+      ) as Map<string, number>;
+      expect(failuresByRefreshToken.has("old-token")).toBe(false);
+      expect(manager.incrementAuthFailures(account)).toBe(1);
+    });
   });
 
   describe("toAuthDetails", () => {
@@ -896,6 +1147,8 @@ describe("AccountManager", () => {
   });
 
   describe("setActiveIndex", () => {
+    // Note: Tests in this block cover in-memory manager behavior.
+    // No-org duplicates collapse only when accountId is same/missing; distinct accountId entries are preserved.
     it("sets active index and returns account", () => {
       const now = Date.now();
       const stored = {
@@ -929,6 +1182,75 @@ describe("AccountManager", () => {
       expect(manager.setActiveIndex(999)).toBeNull();
       expect(manager.setActiveIndex(NaN)).toBeNull();
       expect(manager.setActiveIndex(Infinity)).toBeNull();
+    });
+
+    it("switches between distinct workspace accounts sharing email and token (manager-level, no orgId)", () => {
+      // Note: In-memory manager can hold multiple entries; canonical dedupe would collapse no-org duplicates only when accountId is same/missing
+      const now = Date.now();
+      const stored = {
+        version: 3 as const,
+        activeIndex: 0,
+        accounts: [
+          {
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            accountId: "workspace-a",
+            addedAt: now,
+            lastUsed: now,
+          },
+          {
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            accountId: "workspace-b",
+            addedAt: now,
+            lastUsed: now,
+          },
+        ],
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      expect(manager.getAccountCount()).toBe(2);
+
+      expect(manager.getCurrentAccount()?.accountId).toBe("workspace-a");
+      const switched = manager.setActiveIndex(1);
+      expect(switched?.accountId).toBe("workspace-b");
+      expect(manager.getCurrentAccount()?.accountId).toBe("workspace-b");
+      expect(manager.getActiveIndex()).toBe(1);
+    });
+
+    it("switches between accounts that share accountId/refreshToken but have different organizationId", () => {
+      const now = Date.now();
+      const stored = {
+        version: 3 as const,
+        activeIndex: 0,
+        accounts: [
+          {
+            organizationId: "org-a",
+            accountId: "shared-account",
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            addedAt: now,
+            lastUsed: now,
+          },
+          {
+            organizationId: "org-b",
+            accountId: "shared-account",
+            refreshToken: "shared-refresh",
+            email: "user@example.com",
+            addedAt: now,
+            lastUsed: now,
+          },
+        ],
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      expect(manager.getAccountCount()).toBe(2);
+      expect(manager.getCurrentAccount()?.organizationId).toBe("org-a");
+
+      const switched = manager.setActiveIndex(1);
+      expect(switched?.organizationId).toBe("org-b");
+      expect(manager.getCurrentAccount()?.organizationId).toBe("org-b");
+      expect(manager.getActiveIndex()).toBe(1);
     });
   });
 
@@ -1719,6 +2041,41 @@ describe("AccountManager", () => {
       const selected = manager.getCurrentOrNextForFamilyHybrid("codex");
       expect(selected).not.toBeNull();
       expect(selected?.index).toBe(0);
+    });
+
+    it("reports selection explainability with eligibility reasons", () => {
+      const now = Date.now();
+      const stored = {
+        version: 3 as const,
+        activeIndex: 0,
+        activeIndexByFamily: { codex: 0 },
+        accounts: [
+          { refreshToken: "token-1", addedAt: now, lastUsed: now, enabled: false },
+          { refreshToken: "token-2", addedAt: now, lastUsed: now - 1000 },
+          { refreshToken: "token-3", addedAt: now, lastUsed: now - 2000 },
+          { refreshToken: "token-4", addedAt: now, lastUsed: now - 3000 },
+        ],
+      };
+
+      const manager = new AccountManager(undefined, stored as never);
+      const rateLimited = manager.setActiveIndex(1)!;
+      manager.markRateLimited(rateLimited, 60_000, "codex");
+      getTokenTracker().drain(2, "codex", 100);
+
+      const explainability = manager.getSelectionExplainability("codex", undefined, now);
+      const byIndex = new Map(explainability.map((entry) => [entry.index, entry]));
+
+      expect(byIndex.get(0)?.eligible).toBe(false);
+      expect(byIndex.get(0)?.reasons).toContain("disabled");
+
+      expect(byIndex.get(1)?.eligible).toBe(false);
+      expect(byIndex.get(1)?.reasons).toContain("rate-limited");
+
+      expect(byIndex.get(2)?.eligible).toBe(false);
+      expect(byIndex.get(2)?.reasons).toContain("token-bucket-empty");
+
+      expect(byIndex.get(3)?.eligible).toBe(true);
+      expect(byIndex.get(3)?.reasons).toEqual(["eligible"]);
     });
   });
 });

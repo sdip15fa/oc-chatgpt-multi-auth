@@ -1,0 +1,268 @@
+import { describe, it, expect } from "vitest";
+import { createHash } from "node:crypto";
+
+import {
+	buildBeginnerChecklist,
+	buildBeginnerDoctorFindings,
+	explainRuntimeErrorCategory,
+	formatPromptCacheKey,
+	formatPromptCacheSnapshot,
+	recommendBeginnerNextAction,
+	summarizeBeginnerAccounts,
+	type BeginnerAccountSnapshot,
+	type BeginnerRuntimeSnapshot,
+} from "../lib/ui/beginner.js";
+
+const now = Date.now();
+
+const healthyRuntime: BeginnerRuntimeSnapshot = {
+	totalRequests: 12,
+	failedRequests: 0,
+	rateLimitedResponses: 0,
+	authRefreshFailures: 0,
+	serverErrors: 0,
+	networkErrors: 0,
+	lastErrorCategory: null,
+	promptCacheEnabledRequests: 12,
+	promptCacheMissingRequests: 0,
+	lastPromptCacheKey: "ses_prompt_cache",
+};
+
+function buildAccount(
+	overrides: Partial<BeginnerAccountSnapshot> = {},
+): BeginnerAccountSnapshot {
+	return {
+		index: 0,
+		label: "Account 1 (user@example.com)",
+		accountLabel: "Work",
+		enabled: true,
+		isActive: true,
+		rateLimitedUntil: null,
+		coolingDownUntil: null,
+		...overrides,
+	};
+}
+
+describe("summarizeBeginnerAccounts", () => {
+	it("counts healthy and blocked states", () => {
+		const summary = summarizeBeginnerAccounts(
+			[
+				buildAccount(),
+				buildAccount({
+					index: 1,
+					enabled: false,
+					isActive: false,
+					accountLabel: undefined,
+				}),
+				buildAccount({
+					index: 2,
+					isActive: false,
+					rateLimitedUntil: now + 10_000,
+					accountLabel: undefined,
+				}),
+			],
+			now,
+		);
+
+		expect(summary.total).toBe(3);
+		expect(summary.healthy).toBe(1);
+		expect(summary.blocked).toBe(2);
+		expect(summary.unlabeled).toBe(2);
+	});
+});
+
+describe("buildBeginnerChecklist", () => {
+	it("shows login as incomplete when there are no accounts", () => {
+		const checklist = buildBeginnerChecklist([], now);
+		expect(checklist[0]?.done).toBe(false);
+		expect(checklist[0]?.command).toBe("opencode auth login");
+	});
+
+	it("marks key setup steps complete for healthy account", () => {
+		const checklist = buildBeginnerChecklist([buildAccount()], now);
+		const addAccount = checklist.find((step) => step.id === "add-account");
+		const healthy = checklist.find((step) => step.id === "healthy-account");
+		expect(addAccount?.done).toBe(true);
+		expect(healthy?.done).toBe(true);
+	});
+});
+
+describe("buildBeginnerDoctorFindings", () => {
+	it("returns critical finding when no accounts are present", () => {
+		const findings = buildBeginnerDoctorFindings({
+			accounts: [],
+			now,
+			runtime: healthyRuntime,
+		});
+		expect(findings[0]?.severity).toBe("error");
+		expect(findings[0]?.code).toBe("no-accounts");
+	});
+
+	it("returns ok finding for healthy setup", () => {
+		const findings = buildBeginnerDoctorFindings({
+			accounts: [buildAccount()],
+			now,
+			runtime: healthyRuntime,
+		});
+		expect(findings).toHaveLength(1);
+		expect(findings[0]?.severity).toBe("ok");
+	});
+
+	it("flags elevated failure rate and auth refresh issues", () => {
+		const findings = buildBeginnerDoctorFindings({
+			accounts: [buildAccount()],
+			now,
+			runtime: {
+				...healthyRuntime,
+				totalRequests: 10,
+				failedRequests: 7,
+				authRefreshFailures: 2,
+				lastErrorCategory: "auth-refresh",
+			},
+		});
+		expect(findings.some((f) => f.code === "high-failure-rate")).toBe(true);
+		expect(findings.some((f) => f.code === "auth-refresh-failures")).toBe(true);
+		expect(findings.some((f) => f.code === "recent-error-category")).toBe(true);
+	});
+
+	it("flags missing prompt cache keys when recent requests never supplied one", () => {
+		const findings = buildBeginnerDoctorFindings({
+			accounts: [buildAccount()],
+			now,
+			runtime: {
+				...healthyRuntime,
+				totalRequests: 5,
+				promptCacheEnabledRequests: 0,
+				promptCacheMissingRequests: 5,
+				lastPromptCacheKey: null,
+			},
+		});
+
+		expect(findings.some((f) => f.code === "prompt-cache-missing")).toBe(true);
+	});
+
+	it("flags inconsistent prompt cache usage when only some requests had keys", () => {
+		const findings = buildBeginnerDoctorFindings({
+			accounts: [buildAccount()],
+			now,
+			runtime: {
+				...healthyRuntime,
+				totalRequests: 6,
+				promptCacheEnabledRequests: 4,
+				promptCacheMissingRequests: 2,
+				lastPromptCacheKey: null,
+			},
+		});
+
+		expect(findings.some((f) => f.code === "prompt-cache-inconsistent")).toBe(true);
+	});
+
+	it("does not flag cache issues when no requests have been made", () => {
+		const findings = buildBeginnerDoctorFindings({
+			accounts: [buildAccount()],
+			now,
+			runtime: {
+				...healthyRuntime,
+				totalRequests: 0,
+				promptCacheEnabledRequests: 0,
+				promptCacheMissingRequests: 3,
+				lastPromptCacheKey: null,
+			},
+		});
+
+		expect(findings.some((f) => f.code === "prompt-cache-missing")).toBe(false);
+		expect(findings.some((f) => f.code === "prompt-cache-inconsistent")).toBe(false);
+	});
+});
+
+describe("recommendBeginnerNextAction", () => {
+	it("recommends login when no accounts exist", () => {
+		const action = recommendBeginnerNextAction({
+			accounts: [],
+			now,
+			runtime: healthyRuntime,
+		});
+		expect(action).toContain("opencode auth login");
+	});
+
+	it("recommends switching when rate-limited accounts exist", () => {
+		const action = recommendBeginnerNextAction({
+			accounts: [
+				buildAccount({ rateLimitedUntil: now + 20_000 }),
+				buildAccount({ index: 1, isActive: false }),
+			],
+			now,
+			runtime: healthyRuntime,
+		});
+		expect(action).toContain("codex-switch");
+	});
+
+	it("recommends labeling when multiple accounts are unlabeled", () => {
+		const action = recommendBeginnerNextAction({
+			accounts: [
+				buildAccount({ accountLabel: undefined }),
+				buildAccount({
+					index: 1,
+					isActive: false,
+					accountLabel: undefined,
+				}),
+			],
+			now,
+			runtime: healthyRuntime,
+		});
+		expect(action).toContain("codex-label");
+	});
+});
+
+describe("explainRuntimeErrorCategory", () => {
+	it("returns null for null categories", () => {
+		expect(explainRuntimeErrorCategory(null)).toBeNull();
+	});
+
+	it("maps known categories to beginner hints", () => {
+		expect(explainRuntimeErrorCategory("network")).toContain("Network failures");
+		expect(explainRuntimeErrorCategory("server")).toContain("Server-side");
+		expect(explainRuntimeErrorCategory("rate-limit")).toContain("Rate-limit");
+	});
+
+	it("returns generic guidance for unknown categories", () => {
+		const hint = explainRuntimeErrorCategory("mystery");
+		expect(hint).toContain("mystery");
+		expect(hint).toContain("codex-doctor");
+	});
+});
+
+describe("formatPromptCacheKey", () => {
+	it("returns none for empty values", () => {
+		expect(formatPromptCacheKey(null)).toBe("none");
+		expect(formatPromptCacheKey(undefined)).toBe("none");
+		expect(formatPromptCacheKey("   ")).toBe("none");
+	});
+
+	it("redacts short values too", () => {
+		expect(formatPromptCacheKey("ses_1234")).toBe(
+			`masked-${createHash("sha256").update("ses_1234").digest("hex").slice(0, 12)}`,
+		);
+	});
+
+	it("redacts longer values to a stable masked fingerprint", () => {
+		expect(formatPromptCacheKey("ses_prompt_cache_key_123")).toBe(
+			`masked-${createHash("sha256").update("ses_prompt_cache_key_123").digest("hex").slice(0, 12)}`,
+		);
+	});
+});
+
+describe("formatPromptCacheSnapshot", () => {
+	it("renders a redacted prompt cache snapshot string", () => {
+		const rendered = formatPromptCacheSnapshot({
+			promptCacheEnabledRequests: 4,
+			promptCacheMissingRequests: 1,
+			lastPromptCacheKey: "ses_prompt_cache_key_123",
+		});
+
+		expect(rendered).toBe(
+			`enabled=4, missing=1, lastKey=masked-${createHash("sha256").update("ses_prompt_cache_key_123").digest("hex").slice(0, 12)}`,
+		);
+		expect(rendered).not.toContain("ses_prompt_cache_key_123");
+	});
+});
